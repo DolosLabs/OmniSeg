@@ -10,7 +10,7 @@ A versatile, semi-supervised instance segmentation framework built on PyTorch Li
       * **CNN**: ResNet, ConvNeXt, RepVGG
       * **Hybrid**: Swin Transformer(In Progress)
   * **Modular Segmentation Heads**: Experiment with different instance segmentation approaches:
-      * **Mask2Former**: A state-of-the-art transformer-based segmentation head.(In Progress)
+      * **Mask2Former(In Progress)**: A state-of-the-art transformer-based segmentation head.
       * **Mask R-CNN**: The classic, widely-used two-stage detector.
       * **ContourFormer**: A custom head that predicts object contours directly.
   * **PyTorch Lightning**: Training and validation are managed by PyTorch Lightning, which simplifies boilerplate code, ensures reproducibility, and supports distributed training.
