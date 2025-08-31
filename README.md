@@ -59,7 +59,7 @@ python train.py --backbone resnet --head maskrcnn
 # Example 2: Train a DINO ViT + Mask R-CNN model
 python train.py --backbone dino --head maskrcnn
 
-# Example 3: Train a repvgg + Mask R-CNN model
+# Example 3: Train a repvgg + ContourFormer model
 python train.py --backbone repvgg --head contourformer
 ```
 
