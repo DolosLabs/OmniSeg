@@ -37,7 +37,7 @@ Follow these steps to set up and run OmniSeg.
     pip install -r requirements.txt
     ```
     (Note: You will need to create a `requirements.txt` file from the imports in your code, or manually install them: `pip install transformers torch torchvision tqdm pycocotools pytorch-lightning timm scikit-image scipy`)
-3.  **Prepare the tiny dataset**:
+3.  **Prepare the tiny dataset(optional)**:
     ```bash
     python generate_data.py
     ```
