@@ -119,4 +119,4 @@ This project makes extensive use of and builds upon the work of others in the op
 The semi-supervised learning framework in this project is inspired by the **Mean Teacher** methodology, which is an effective approach for training with limited labeled data.
 
 -----
-**Contact**: Your Name - https://doloslabs.com
+**Contact**: Ben Harris - https://doloslabs.com
