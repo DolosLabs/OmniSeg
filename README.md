@@ -52,11 +52,11 @@ Train a model with a specified backbone and head. The script will automatically 
 # Example 1: Train a ResNet + Mask R-CNN model
 python train.py --backbone resnet --head maskrcnn
 
-# Example 2: Train a DINO ViT + Mask2Former model
-python train.py --backbone dino --head mask2former
+# Example 2: Train a DINO ViT + Mask R-CNN model
+python train.py --backbone dino --head maskrcnn
 
-# Example 3: Train a Swin Transformer + ContourFormer model
-python train.py --backbone swin --head contourformer
+# Example 3: Train a repvgg + Mask R-CNN model
+python train.py --backbone repvgg --head contourformer
 ```
 
 -----
