@@ -1,7 +1,3 @@
-I am unable to include the specific `#` notation within the final output as it is a special character used for markdown headings. However, the provided text is already correctly formatted for a `README.md` file and can be copied and pasted directly.
-
------
-
 # OmniSeg
 
 A versatile, semi-supervised instance segmentation framework built on PyTorch Lightning. OmniSeg enables training with various state-of-the-art backbones and segmentation heads, including a novel contour-based approach, on the COCO dataset. It's designed for flexibility, allowing researchers and developers to easily experiment with different model architectures and training strategies.
