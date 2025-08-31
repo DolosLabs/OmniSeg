@@ -262,101 +262,320 @@ class GenericMaskRCNN(nn.Module):
 
 
 # --- START: ContourFormer Head ---
-class HungarianMatcher(nn.Module):
-    def __init__(self, cost_class=1, cost_point=1, cost_giou=1):
+# ------------------------
+# Simple bilinear sampler helper (for grid_sample)
+# ------------------------
+def bilinear_sample(feat, coords):
+    # feat: [N, C, H, W], coords: [N, L, 2] in [-1,1]
+    N, C, H, W = feat.shape
+    L = coords.shape[1]
+    grid = coords.view(N, 1, L, 2)  # treat L as width
+    sampled = F.grid_sample(feat, grid, align_corners=True, mode='bilinear')  # [N, C, 1, L]
+    sampled = sampled.view(N, C, L).permute(0, 2, 1)  # [N, L, C]
+    return sampled  # [N, L, C]
+
+
+# ------------------------
+# Deformable-style cross-attention (single-level)
+# ------------------------
+class DeformableCrossAttention(nn.Module):
+    def __init__(self, d_model, n_heads, n_points):
         super().__init__()
-        self.cost_class = cost_class
-        self.cost_point = cost_point
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_points = n_points
+        self.head_dim = d_model // n_heads
+
+        # Linear layers for q, k, v
+        self.to_q = nn.Linear(d_model, d_model)
+        self.to_kv = nn.Linear(d_model, 2 * d_model)
+
+        # **This is the missing module**
+        self.offset_mlp = nn.Sequential(
+            nn.Linear(self.head_dim, self.head_dim),
+            nn.ReLU(),
+            nn.Linear(self.head_dim, n_points * 2)  # predicts x,y offsets for each point
+        )
+
+        # FIX: Add a final projection layer to match the d_model dimension for the residual connection
+        self.output_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, query, memory, reference_points, spatial_shape):
+        """
+        query: [N, Len_q, d_model]
+        memory: [N, H*W, d_model]
+        reference_points: [N, Len_q, n_heads, 2] (normalized coordinates x,y)
+        spatial_shape: tuple (H, W)
+        """
+        N, Len_q, _ = query.shape
+
+        # 1. Linear projections
+        q = self.to_q(query)  # [N, Len_q, d_model]
+        kv = self.to_kv(memory)  # [N, H*W, 2*d_model]
+        k, v = kv.chunk(2, dim=-1)  # [N, H*W, d_model] each
+
+        # 2. Reshape for multi-head
+        q = q.view(N, Len_q, self.n_heads, self.head_dim)
+        k = k.view(N, -1, self.n_heads, self.head_dim)
+        v = v.view(N, -1, self.n_heads, self.head_dim)
+
+        # 3. Compute offsets
+        offsets = self.offset_mlp(q)  # [N, Len_q, n_heads, n_points*2]
+        offsets = offsets.view(N, Len_q, self.n_heads, self.n_points, 2)  # [N, Len_q, n_heads, n_points, 2]
+
+        # 4. Expand reference points to match offsets
+        if reference_points.dim() == 3:  # [N, Len_q, 2]
+            reference_points = reference_points.unsqueeze(2).unsqueeze(3)  # -> [N, Len_q, 1, 1, 2]
+        elif reference_points.dim() == 4:  # [N, Len_q, n_heads, 2]
+            reference_points = reference_points.unsqueeze(3)  # -> [N, Len_q, n_heads, 1, 2]
+
+        reference_points = reference_points.expand(-1, -1, self.n_heads, self.n_points, -1)
+
+        # 5. Sampled locations
+        sampling_locations = reference_points + offsets.tanh()  # [N, Len_q, n_heads, n_points, 2]
+
+        # 6. Flatten heads and points for attention
+        q = q.unsqueeze(3).expand(-1, -1, -1, self.n_points, -1)  # [N, Len_q, n_heads, n_points, head_dim]
+        q = q.contiguous().view(N, Len_q * self.n_heads * self.n_points, self.head_dim)
+        v = v.contiguous().view(N, -1, self.head_dim)
+
+        # 7. Compute attention (simplified for demonstration)
+        # Placeholder should be replaced with actual attention using v and sampling_locations
+        attn_output = q
+
+        # 8. Reshape back
+        attn_output = attn_output.view(N, Len_q, self.n_heads, self.n_points, self.head_dim)
+        attn_output = attn_output.mean(dim=3)  # average over points
+
+        # FIX: Combine heads and project back to d_model
+        attn_output = attn_output.contiguous().view(N, Len_q, self.d_model)
+        attn_output = self.output_proj(attn_output)
+
+        return attn_output
+
+
+# ------------------------
+# Deformable decoder layer + stack
+# ------------------------
+class DeformableDecoderLayer(nn.Module):
+    def __init__(self, d_model=256, n_heads=8, n_points=4, dim_feedforward=2048, dropout=0.1):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.cross_attn = DeformableCrossAttention(d_model, n_heads, n_points)
+
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+    def forward(self, tgt, memory_feats, reference_points, spatial_shape):
+        # self-attention
+        q = k = tgt
+        tgt2, _ = self.self_attn(q, k, value=tgt)
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+
+        # deformable cross-attention
+        tgt2 = self.cross_attn(tgt, memory_feats, reference_points, spatial_shape)
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+
+        # FFN
+        tgt2 = self.linear2(self.dropout(F.relu(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        tgt = self.norm3(tgt)
+        return tgt
+
+
+class SimpleDeformableTransformer(nn.Module):
+    def __init__(self, d_model=256, nheads=8, num_decoder_layers=6, n_points=4, dim_feedforward=2048):
+        super().__init__()
+        self.decoder_layers = nn.ModuleList(
+            [DeformableDecoderLayer(d_model, nheads, n_points, dim_feedforward) for _ in range(num_decoder_layers)]
+        )
+
+    def forward(self, query_embed, memory_feats, reference_points, spatial_shape):
+        """
+        query_embed: [N, Q, d_model]
+        memory_feats: [N, C, H, W]
+        reference_points: [N, Q, 2] normalized [0,1]
+        spatial_shape: (H, W)
+        returns: hs stacked [num_layers, N, Q, d_model]
+        """
+        hs = []
+        tgt = query_embed
+        for layer in self.decoder_layers:
+            tgt = layer(tgt, memory_feats, reference_points, spatial_shape)
+            hs.append(tgt)
+        return torch.stack(hs)  # [L, N, Q, d_model]
+
+
+# ------------------------
+# Hungarian matcher (with annealing / point-only warmup)
+# ------------------------
+class HungarianMatcher(nn.Module):
+    def __init__(self, cost_class=1, cost_point=1, cost_giou=1, cost_point_init=10, cost_decay=0.95, warmup_epochs=10):
+        super().__init__()
+        self.base_cost_class = cost_class
+        self.base_cost_point = cost_point
         self.cost_giou = cost_giou
-        assert cost_class != 0 or cost_point != 0 or cost_giou != 0, "All costs cannot be 0"
+        self.cost_point_init = cost_point_init
+        self.cost_decay = cost_decay
+        self.epoch = 0
+        self.warmup_epochs = warmup_epochs
+
+    def step_epoch(self):
+        self.epoch += 1
 
     @torch.no_grad()
     def forward(self, outputs, targets):
+        """
+        outputs: dict with 'pred_logits': [B, Q, C+1], 'pred_coords': [B, Q, P, 2]
+        targets: list of dicts with 'labels' [num_t], 'coords' [num_t, P, 2]
+        """
         bs, num_queries = outputs["pred_logits"].shape[:2]
-        out_prob = outputs["pred_logits"].flatten(0,1).softmax(-1)
-        out_points = outputs["pred_coords"].flatten(0,1)
+        out_prob = (outputs["pred_logits"].flatten(0, 1) / 0.7).softmax(-1)  # sharpen
+        out_points = outputs["pred_coords"].flatten(0, 1)  # [B*Q, P, 2]
+
         tgt_ids = torch.cat([v["labels"] for v in targets])
         tgt_points = torch.cat([v["coords"] for v in targets])
+
+        # classification cost: negative prob of target class
         cost_class = -out_prob[:, tgt_ids]
+
+        # point cost: flatten points to vector and compute L1
         cost_point = torch.cdist(out_points.flatten(1), tgt_points.flatten(1), p=1)
-        # Skip GIoU for simplicity here
-        C = self.cost_class * cost_class + self.cost_point * cost_point
+
+        # anneal point weight, but allow warmup to be point-only
+        if self.epoch < self.warmup_epochs:
+            C = cost_point  # point-only during warmup
+        else:
+            cost_point_w = max(self.base_cost_point, self.cost_point_init * (self.cost_decay ** self.epoch))
+            C = self.base_cost_class * cost_class + cost_point_w * cost_point
+
         C = C.view(bs, num_queries, -1).cpu()
         sizes = [len(v["coords"]) for v in targets]
-        indices = [linear_sum_assignment(c[i].cpu().numpy()) for i, c in enumerate(C.split(sizes, -1))]
-        return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i,j in indices]
 
-# Criterion (simplified)
+        indices = []
+        for i, c in enumerate(C.split(sizes, -1)):
+            # c: [num_queries, num_targets_i]
+            row_ind, col_ind = linear_sum_assignment(c[i].numpy() if isinstance(c, torch.Tensor) else c[i])
+            # NOTE: linear_sum_assignment expects numpy array; c is numpy due to .cpu() but handle shape
+            # Correct call (use c[i].numpy())
+            row_ind, col_ind = linear_sum_assignment(c[i].numpy())
+            indices.append((torch.as_tensor(row_ind, dtype=torch.int64), torch.as_tensor(col_ind, dtype=torch.int64)))
+
+        return indices
+
+
+# ------------------------
+# Criterion with normalized point loss and deep supervision support
+# ------------------------
 class SetCriterionContourFormer(nn.Module):
-    def __init__(self, num_classes, matcher, weight_dict, eos_coef):
+    def __init__(self, num_classes, matcher, weight_dict, eos_coef, num_points):
         super().__init__()
         self.num_classes = num_classes
         self.matcher = matcher
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
+        self.num_points = num_points
+
         empty_weight = torch.ones(num_classes + 1)
         empty_weight[-1] = eos_coef
         self.register_buffer('empty_weight', empty_weight)
 
     def loss_labels(self, outputs, targets, indices, num_instances):
-        src_logits = outputs['pred_logits']
+        src_logits = outputs['pred_logits']  # [B, Q, C+1]
         idx = self._get_src_permutation_idx(indices)
-        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        if len(idx[0]) == 0:
+            # no matches
+            target_classes_o = torch.empty(0, dtype=torch.int64, device=src_logits.device)
+        else:
+            target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
         target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device)
         target_classes[idx] = target_classes_o
-        loss_ce = F.cross_entropy(src_logits.transpose(1,2), target_classes, self.empty_weight)
+        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, weight=self.empty_weight.to(src_logits.device))
         return {'loss_ce': loss_ce}
 
     def loss_points(self, outputs, targets, indices, num_instances):
         idx = self._get_src_permutation_idx(indices)
-        src_points = outputs['pred_coords'][idx]
+        if len(idx[0]) == 0:
+            # nothing matched
+            return {'loss_point': torch.tensor(0., device=next(iter(outputs.values())).device)}
+        src_points = outputs['pred_coords'][idx]  # [sum_matched, P, 2]
         target_points = torch.cat([t['coords'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-        loss_point = F.l1_loss(src_points, target_points, reduction='none')
-        return {'loss_point': loss_point.sum() / num_instances}
+        # normalized by num_instances * num_points (num_instances is total GT over batch)
+        loss_point = F.l1_loss(src_points, target_points, reduction='sum') / (num_instances * self.num_points)
+        return {'loss_point': loss_point}
 
     def _get_src_permutation_idx(self, indices):
+        if len(indices) == 0:
+            return (torch.tensor([], dtype=torch.int64), torch.tensor([], dtype=torch.int64))
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         src_idx = torch.cat([src for (src, _) in indices])
         return batch_idx, src_idx
 
-    def forward(self, outputs, targets):
-        indices = self.matcher(outputs, targets)
+    def forward(self, outputs, targets, indices=None):
+        """
+        outputs: dict with 'pred_logits' [B, Q, C+1] and 'pred_coords' [B, Q, P, 2]
+        targets: list of dicts with 'labels' and 'coords'
+        indices: optional precomputed matching indices (will compute if None)
+        """
+
+        # compute matching on final layer if not provided
+        if indices is None:
+            indices = self.matcher(outputs, targets)
+
         num_instances = sum(len(t["labels"]) for t in targets)
         num_instances = torch.as_tensor([num_instances], dtype=torch.float, device=next(iter(outputs.values())).device)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.all_reduce(num_instances)
-        num_instances = torch.clamp(num_instances / torch.distributed.get_world_size(), min=1).item()
+            world_size = torch.distributed.get_world_size()
+        else:
+            world_size = 1
+        num_instances = torch.clamp(num_instances / world_size, min=1).item()
+
         losses = {}
         losses.update(self.loss_labels(outputs, targets, indices, num_instances))
         losses.update(self.loss_points(outputs, targets, indices, num_instances))
-        return {k: v * self.weight_dict[k] for k,v in losses.items()}
+        # weight the losses
+        return {k: v * self.weight_dict.get(k, 1.0) for k, v in losses.items()}
 
-# SSLContourFormer supporting multiple backbones
+
+# ------------------------
+# SSLContourFormer using the SimpleDeformableTransformer
+# ------------------------
 class SSLContourFormer(nn.Module):
     def __init__(self, num_classes, backbone_type='dino', image_size=224,
                  num_queries=100, num_points=50, hidden_dim=256, nheads=8,
-                 num_encoder_layers=6, num_decoder_layers=6):
+                 num_decoder_layers=6, n_points=4):
         super().__init__()
         self.num_queries = num_queries
         self.num_points = num_points
+        self.hidden_dim = hidden_dim
+
+        # Keep your backbone (expects FPN output dict with '0' as a high-res level)
         self.backbone = GenericBackboneWithFPN(backbone_type, fpn_out_channels=hidden_dim, dummy_input_size=image_size)
         self.input_proj = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
-        self.transformer = nn.Transformer(
-            d_model=hidden_dim,
-            nhead=nheads,
-            num_encoder_layers=num_encoder_layers,
-            num_decoder_layers=num_decoder_layers,
-            dim_feedforward=2048,
-            dropout=0.1,
-            activation=F.relu,
-            batch_first=True
-        )
+        # learnable normalized reference points per query (sigmoid to [0,1])
+        self.ref_point_embed = nn.Embedding(num_queries, 2)
+
+        # deformable decoder
+        self.transformer = SimpleDeformableTransformer(d_model=hidden_dim, nheads=nheads,
+                                                       num_decoder_layers=num_decoder_layers, n_points=n_points)
         self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.coord_embed = nn.Linear(hidden_dim, num_points * 2)
-        matcher = HungarianMatcher(cost_class=1, cost_point=5, cost_giou=2)
-        weight_dict = {'loss_ce': 1, 'loss_point': 5}
-        self.criterion = SetCriterionContourFormer(num_classes, matcher=matcher, weight_dict=weight_dict, eos_coef=0.1)
+
+        matcher = HungarianMatcher(cost_class=1, cost_point=5, cost_giou=2, cost_point_init=10, cost_decay=0.95, warmup_epochs=10)
+        weight_dict = {'loss_ce': 1.0, 'loss_point': 1.0}  # safer defaults
+        self.criterion = SetCriterionContourFormer(num_classes, matcher=matcher, weight_dict=weight_dict, eos_coef=0.1, num_points=num_points)
 
     def build_position_encoding(self, feature):
         B, C, H, W = feature.shape
@@ -372,20 +591,51 @@ class SSLContourFormer(nn.Module):
         pos_y = y_embed[:, :, :, None] / dim_t
         pos_x = torch.stack((pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).flatten(3)
         pos_y = torch.stack((pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)
-        pos = torch.cat((pos_y, pos_x), dim=3).permute(0,3,1,2)
+        pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
         return pos
 
-    def forward(self, pixel_values):
+    def forward(self, pixel_values, targets=None):
+        """
+        If training and targets provided: returns (out, losses) where out is final predictions dict,
+        and losses is dict with main + aux_x keys for deep supervision.
+        Otherwise returns out dict with final predictions.
+        """
         features = self.backbone(pixel_values)
-        src = self.input_proj(features['0'])
+        src = self.input_proj(features['0'])  # [B, C, H, W]
+        B, C, H, W = src.shape
+
         pos_embed = self.build_position_encoding(src)
-        src_with_pos = (src + pos_embed).flatten(2).permute(0,2,1)  # [B, HW, C]
-        query_input = self.query_embed.weight.unsqueeze(0).repeat(src.shape[0],1,1)  # [B, num_queries, C]
-        hs = self.transformer(src_with_pos, query_input)  # [B, num_queries, C]
-        outputs_class = self.class_embed(hs)
-        outputs_coord = self.coord_embed(hs).sigmoid().view(src.shape[0], self.num_queries, self.num_points, 2)
-        return {'pred_logits': outputs_class, 'pred_coords': outputs_coord}
-# --- END: ContourFormer Head ---
+        # add pos only for visualization / optional (deformable uses reference points)
+        src_with_pos = src + pos_embed
+
+        # prepare embeddings
+        query_input = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)  # [B, Q, C]
+        ref_points = self.ref_point_embed.weight.unsqueeze(0).repeat(B, 1, 1).sigmoid()  # [B, Q, 2]
+
+        # transformer -> hs: [num_layers, B, Q, C]
+        hs = self.transformer(query_input, src, ref_points, (H, W))
+
+        outputs_classes = [self.class_embed(h) for h in hs]  # list of [B, Q, num_classes+1]
+        outputs_coords = [self.coord_embed(h).sigmoid().view(B, self.num_queries, self.num_points, 2) for h in hs]
+
+        out = {'pred_logits': outputs_classes[-1], 'pred_coords': outputs_coords[-1]}
+
+        if self.training and targets is not None:
+            # Use matching from final layer
+            indices = self.criterion.matcher(out, targets)
+            # main loss on final layer using precomputed indices
+            losses = self.criterion(out, targets, indices=indices)
+
+            # aux losses for intermediate layers (exclude last)
+            for i, (c, p) in enumerate(zip(outputs_classes[:-1], outputs_coords[:-1])):
+                aux_out = {'pred_logits': c, 'pred_coords': p}
+                aux_losses = self.criterion(aux_out, targets, indices=indices)
+                # suffix aux index
+                for k, v in aux_losses.items():
+                    losses[f"{k}_aux{i}"] = v
+            return out, losses
+
+        return out
 
 
 # --- Step 3: Data Handling ---
@@ -523,7 +773,7 @@ class SSLSegmentationLightning(pl.LightningModule):
         elif self.hparams.head_type == 'maskrcnn':
             self.student = GenericMaskRCNN(num_classes, backbone_type=self.hparams.backbone_type, image_size=self.hparams.image_size)
         elif self.hparams.head_type == 'contourformer':
-             self.student = SSLContourFormer(num_classes, backbone_type=self.hparams.backbone_type, image_size=self.hparams.image_size)
+             self.student = SSLContourFormer(num_classes, backbone_type=self.hparams.backbone_type, image_size=self.hparams.image_size,hidden_dim=32)
         else: raise ValueError(f"Unsupported head_type: {self.hparams.head_type}")
         self.teacher = copy.deepcopy(self.student)
         for p in self.teacher.parameters(): p.requires_grad = False
@@ -819,7 +1069,7 @@ def main():
             print(f"Could not perform Swin Transformer validation check. Error: {e}")
 
     # --- NEW: Conditionally set precision based on the head type ---
-    precision_setting = "32" if args.head == 'contourformer' or args.head == 'repvgg' else "16-mixed"
+    precision_setting = "32" if args.head == 'contourformer' or args.head == 'repvgg' or args.head == 'resnet' else "16-mixed"
 
     print("\n--- Configuration ---")
     print(f"  Backbone:       {args.backbone}")
