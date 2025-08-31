@@ -29,7 +29,7 @@ Follow these steps to set up and run OmniSeg.
 
 1.  **Clone the repository**:
     ```bash
-    git clone https://github.com/your-username/omniseg.git
+    git clone https://github.com/DolosLabs/omniseg.git
     cd omniseg
     ```
 2.  **Install dependencies**:
@@ -37,7 +37,11 @@ Follow these steps to set up and run OmniSeg.
     pip install -r requirements.txt
     ```
     (Note: You will need to create a `requirements.txt` file from the imports in your code, or manually install them: `pip install transformers torch torchvision tqdm pycocotools pytorch-lightning timm scikit-image scipy`)
-3.  **Prepare the dataset**:
+3.  **Prepare the tiny dataset**:
+    ```bash
+    python generate_data.py
+    ```
+4.  **or Prepare the coco2017 dataset**:
     The script automatically handles the download and extraction of the COCO 2017 dataset when you first run it. No manual setup is required.
 
 ## 💻 Usage
