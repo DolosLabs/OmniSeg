@@ -6,11 +6,11 @@ A versatile, semi-supervised instance segmentation framework built on PyTorch Li
 
   * **Semi-Supervised Learning (SSL)**: Leverages a teacher-student model architecture to use both labeled and unlabeled data, a crucial technique for training with limited annotations.
   * **Flexible Backbones**: Supports a wide range of popular vision models as backbones, including:
-      * **ViT**: DINO, SAM
+      * **ViT**: DINO, SAM(In Progress)
       * **CNN**: ResNet, ConvNeXt, RepVGG
-      * **Hybrid**: Swin Transformer
+      * **Hybrid**: Swin Transformer(In Progress)
   * **Modular Segmentation Heads**: Experiment with different instance segmentation approaches:
-      * **Mask2Former**: A state-of-the-art transformer-based segmentation head.
+      * **Mask2Former**: A state-of-the-art transformer-based segmentation head.(In Progress)
       * **Mask R-CNN**: The classic, widely-used two-stage detector.
       * **ContourFormer**: A custom head that predicts object contours directly.
   * **PyTorch Lightning**: Training and validation are managed by PyTorch Lightning, which simplifies boilerplate code, ensures reproducibility, and supports distributed training.
