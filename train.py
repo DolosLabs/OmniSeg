@@ -819,7 +819,7 @@ def main():
             print(f"Could not perform Swin Transformer validation check. Error: {e}")
 
     # --- NEW: Conditionally set precision based on the head type ---
-    precision_setting = "32" if args.head == 'contourformer' else "16-mixed"
+    precision_setting = "32" if args.head == 'contourformer' or args.head == 'repvgg' else "16-mixed"
 
     print("\n--- Configuration ---")
     print(f"  Backbone:       {args.backbone}")
