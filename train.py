@@ -37,10 +37,8 @@ import tqdm
 import pytorch_lightning as pl
 from pytorch_lightning.utilities.combined_loader import CombinedLoader
 from pytorch_lightning.callbacks import ModelCheckpoint
-from transformers import (AutoModel, AutoConfig, DeformableDetrConfig, DeformableDetrModel, DeformableDetrImageProcessor)
-from transformers.models.deformable_detr.modeling_deformable_detr import DeformableDetrSinePositionEmbedding
-# --- FIX: Add specific import for BaseModelOutput ---
-from transformers.modeling_outputs import BaseModelOutput
+from transformers import AutoModel, AutoConfig
+from types import SimpleNamespace
 
 
 from torchvision.models.detection import MaskRCNN
@@ -336,7 +334,7 @@ class SetCriterionDETR(nn.Module):
                     l_dict = getattr(self, f"loss_{loss}")(aux_outputs, targets, indices, num_boxes)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
-        return {k: v * self.weight_dict[k.split('_')[0]] for k, v in losses.items() if k.split('_')[0] in self.weight_dict}
+        return {k: v * self.weight_dict[k] for k, v in losses.items() if k in self.weight_dict}
 
 class SSLDeformableDETR(nn.Module):
     def __init__(self, num_classes, backbone_type='dino', image_size=224):
@@ -344,51 +342,97 @@ class SSLDeformableDETR(nn.Module):
         self.num_classes = num_classes
         self.backbone = GenericBackboneWithFPN(backbone_type, fpn_out_channels=256, dummy_input_size=image_size)
         
-        config = DeformableDetrConfig(num_labels=num_classes)
-        self.detr = DeformableDetrModel(config)
+        # DETR configuration
+        self.d_model = 256
+        self.num_queries = 100
         
-        self.position_embedding = DeformableDetrSinePositionEmbedding(config.d_model // 2, normalize=True)
+        # Query embeddings 
+        self.query_embed = nn.Embedding(self.num_queries, self.d_model)
         
-        self.class_embed = nn.Linear(config.d_model, num_classes + 1)
-        self.bbox_embed = nn.Sequential(nn.Linear(config.d_model, config.d_model), nn.ReLU(), nn.Linear(config.d_model, 4))
-        self.mask_head = nn.Sequential(nn.Linear(config.d_model, config.d_model), nn.ReLU(), nn.Linear(config.d_model, 256))
-        self.mask_out_stride = 8
-        self.mask_pred_stride = 4 # From the F.interpolate in the forward pass
-        
-        matcher = HungarianMatcherDETR(cost_class=config.class_cost, cost_bbox=config.bbox_cost, cost_giou=config.giou_cost)
-        weight_dict = {"loss_ce": 1.0, "loss_bbox": config.bbox_loss_coefficient, "loss_giou": config.giou_loss_coefficient, "loss_mask": 1.0, "loss_dice": 1.0}
-        self.criterion = SetCriterionDETR(num_classes, matcher=matcher, weight_dict=weight_dict, eos_coef=config.eos_coefficient)
-
-    def forward(self, pixel_values, pixel_mask=None, targets=None):
-        # 1. Run the backbone and FPN ONCE to get all feature maps.
-        feature_maps = self.backbone(pixel_values)
-        
-        # The DETR model from Hugging Face expects a list of tensors, not a dictionary.
-        features_list = list(feature_maps.values())
-
-        # --- FIX START ---
-        # 2. Create a default pixel_mask if one isn't provided.
-        # The model requires this mask when multi-scale features are passed as a list.
-        if pixel_mask is None:
-            batch_size, _, height, width = pixel_values.shape
-            pixel_mask = torch.ones((batch_size, height, width), dtype=torch.long, device=pixel_values.device)
-        # --- FIX END ---
-
-        # 3. Pass the feature maps AND the mask to the DETR transformer.
-        outputs = self.detr(pixel_values=pixel_values, pixel_mask=pixel_mask)
-    
-        decoder_output = outputs.last_hidden_state
+        # Simple transformer decoder (simplified version of DETR)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=self.d_model,
+            nhead=8,
+            dim_feedforward=2048,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=6)
         
         # Prediction heads
+        self.class_embed = nn.Linear(self.d_model, num_classes + 1)
+        self.bbox_embed = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model),
+            nn.ReLU(),
+            nn.Linear(self.d_model, 4)
+        )
+        self.mask_head = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model), 
+            nn.ReLU(),
+            nn.Linear(self.d_model, 256)
+        )
+        
+        # Loss computation
+        config = SimpleNamespace(
+            class_cost=1.0,
+            bbox_cost=5.0,
+            giou_cost=2.0,
+            bbox_loss_coefficient=5.0,
+            giou_loss_coefficient=2.0,
+            eos_coefficient=0.1
+        )
+        
+        matcher = HungarianMatcherDETR(
+            cost_class=config.class_cost, 
+            cost_bbox=config.bbox_cost, 
+            cost_giou=config.giou_cost
+        )
+        weight_dict = {
+            "loss_ce": 1.0, 
+            "loss_bbox": config.bbox_loss_coefficient, 
+            "loss_giou": config.giou_loss_coefficient, 
+            "loss_mask": 1.0, 
+            "loss_dice": 1.0
+        }
+        self.criterion = SetCriterionDETR(
+            num_classes, 
+            matcher=matcher, 
+            weight_dict=weight_dict, 
+            eos_coef=config.eos_coefficient
+        )
+
+    def forward(self, pixel_values, pixel_mask=None, targets=None):
+        # 1. Extract backbone features
+        feature_maps = self.backbone(pixel_values)
+        
+        # 2. Use the finest feature map as memory for the transformer
+        finest_features = feature_maps['0']  # Shape: [B, 256, H, W]
+        B, C, H, W = finest_features.shape
+        
+        # Flatten spatial dimensions for transformer
+        memory = finest_features.flatten(2).transpose(1, 2)  # [B, H*W, 256]
+        
+        # 3. Get query embeddings
+        query_embeds = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)  # [B, num_queries, 256]
+        
+        # 4. Apply transformer decoder
+        # Create memory key padding mask (all False since we don't mask any memory positions)
+        memory_key_padding_mask = torch.zeros(B, H*W, dtype=torch.bool, device=pixel_values.device)
+        
+        decoder_output = self.transformer_decoder(
+            tgt=query_embeds,
+            memory=memory,
+            memory_key_padding_mask=memory_key_padding_mask
+        )  # [B, num_queries, 256]
+        
+        # 5. Apply prediction heads
         logits = self.class_embed(decoder_output)
         pred_boxes = self.bbox_embed(decoder_output).sigmoid()
         mask_embeds = self.mask_head(decoder_output)
-    
-        # Reuse the finest feature map for mask prediction
-        fpn_finest = feature_maps['0'] 
-        B, C, H, W = fpn_finest.shape
-        pred_masks = (mask_embeds @ fpn_finest.view(B, C, H * W)).view(B, -1, H, W)
-    
+        
+        # 6. Compute mask predictions using finest feature map
+        pred_masks = (mask_embeds @ finest_features.view(B, C, H * W)).view(B, -1, H, W)
+        
         outputs = {
             "pred_logits": logits,
             "pred_boxes": pred_boxes,
@@ -864,7 +908,7 @@ class SSLSegmentationLightning(pl.LightningModule):
         for p in self.teacher.parameters(): p.requires_grad = False
         self.teacher.eval()
         if self.hparams.head_type == 'deformable_detr':
-            self.detr_image_processor = DeformableDetrImageProcessor.from_pretrained("SenseTime/deformable-detr")
+            pass  # No special preprocessing needed anymore
 
         self.train_aug = get_transforms(augment=True, image_size=self.hparams.image_size)
         self.val_aug = get_transforms(augment=False, image_size=self.hparams.image_size)
@@ -1007,18 +1051,47 @@ class SSLSegmentationLightning(pl.LightningModule):
             self.val_aug(img) for img in images
         ]).to(device=self.device, dtype=self.dtype)
     
-        # forward pass
-        outputs = self.student(pixel_values)
+        # Prepare targets in DETR format for loss computation
+        targets_detr = []
+        h, w = self.hparams.image_size, self.hparams.image_size
+        for target in targets:
+            boxes_xyxy = masks_to_boxes(target["masks"])
+            boxes_cxcywh = box_convert(boxes_xyxy, in_fmt="xyxy", out_fmt="cxcywh")
+            boxes_cxcywh[:, 0::2] /= w  # normalize x coords
+            boxes_cxcywh[:, 1::2] /= h  # normalize y coords
+            
+            # Resize masks to match model's expected size
+            mask_target_size = (h // 2, w // 2)  # Adjust based on model's mask output size
+            resized_masks = F.interpolate(
+                target["masks"].unsqueeze(1), 
+                size=mask_target_size, 
+                mode="bilinear", 
+                align_corners=False
+            ).squeeze(1)
+            
+            targets_detr.append({
+                "labels": target["labels"].to(self.device),
+                "boxes": boxes_cxcywh.to(self.device),
+                "masks": resized_masks.to(self.device)
+            })
     
-        # --- Resize pred masks to target mask size ---
-        # DETR-style mask heads usually produce (B, num_queries, H_pred, W_pred)
+        # forward pass with targets to get loss
+        outputs, losses = self.student(pixel_values, targets=targets_detr)
+        
+        # Compute and store validation loss
+        if losses:
+            val_loss = sum(losses.values())
+            if torch.is_tensor(val_loss):
+                self.validation_step_losses.append(val_loss)
+    
+        # --- Resize pred masks to target mask size for mAP evaluation ---
         pred_masks = outputs["pred_masks"]
     
         # ensure correct shape for interpolate: (B*num_queries, 1, H_pred, W_pred)
         B, Q, H, W = pred_masks.shape
         pred_masks = pred_masks.reshape(B * Q, 1, H, W)
     
-        # resize to ground truth resolution
+        # resize to ground truth resolution  
         target_size = targets[0]['masks'].shape[-2:]  # (H, W)
         pred_masks = F.interpolate(
             pred_masks, size=target_size, mode="bilinear", align_corners=False
@@ -1027,17 +1100,61 @@ class SSLSegmentationLightning(pl.LightningModule):
         # back to (B, Q, H, W)
         pred_masks = pred_masks.reshape(B, Q, *target_size)
     
-        # extract target info
-        orig_sizes = [tuple(t['masks'].shape[1:]) for t in targets]  # (h, w)
-        img_ids = [t['image_id'] for t in targets]
+        # Process predictions for mAP evaluation
+        coco_formatted_results = []
+        
+        for b in range(B):
+            # Get predictions for this batch item
+            scores = outputs['pred_logits'][b].softmax(-1)
+            max_scores, labels = scores[..., :-1].max(-1)  # Exclude background class
+            boxes = outputs['pred_boxes'][b]
+            masks = pred_masks[b]
+            
+            # Filter by confidence threshold
+            keep = max_scores > 0.05
+            if keep.sum() == 0:
+                continue
+                
+            final_scores = max_scores[keep]
+            final_labels = labels[keep]  
+            final_boxes = boxes[keep]
+            final_masks = masks[keep]
+            
+            target = targets[b]
+            img_id = target['image_id']
+            
+            # Convert to COCO format
+            for i in range(len(final_scores)):
+                # Convert normalized boxes back to original image coordinates
+                orig_h, orig_w = target['masks'].shape[-2:]
+                box = final_boxes[i] * torch.tensor([orig_w, orig_h, orig_w, orig_h], device=final_boxes.device)
+                
+                # Convert mask to RLE format
+                mask = (final_masks[i] > 0.5).cpu().numpy().astype(np.uint8)
+                rle = mask_utils.encode(np.asfortranarray(mask))
+                rle['counts'] = rle['counts'].decode('utf-8')
+                
+                # Map model label to COCO category
+                model_label = final_labels[i].item()
+                category_id = self.trainer.datamodule.label2cat.get(model_label, 1)  # Default to category 1 if not found
+                
+                coco_formatted_results.append({
+                    "image_id": img_id,
+                    "category_id": category_id,
+                    "segmentation": rle,
+                    "score": final_scores[i].item()
+                })
+        
+        # Store results for mAP computation
+        self.validation_step_outputs.append(coco_formatted_results)
     
         # return what your criterion / evaluator needs
         return {
             "outputs": outputs,
             "targets": targets,
             "pred_masks": pred_masks,
-            "orig_sizes": orig_sizes,
-            "img_ids": img_ids,
+            "orig_sizes": [tuple(t['masks'].shape[1:]) for t in targets],
+            "img_ids": [t['image_id'] for t in targets],
         }
 
 
