@@ -21,10 +21,15 @@ omniseg/
 │   │   ├── convnext.py      # ConvNeXt backbone
 │   │   ├── repvgg.py        # RepVGG backbone
 │   │   └── resnet.py        # ResNet backbone
-│   └── heads/               # TODO: Segmentation heads (complex, kept in original)
+│   └── heads/               # ✅ Segmentation heads (now extracted)
+│       ├── __init__.py      # Head factory and imports
+│       ├── maskrcnn.py      # Mask R-CNN head
+│       ├── deformable_detr.py # Deformable DETR head (extracted)  
+│       └── contourformer.py # ContourFormer head (extracted)
 ├── utils/
 │   └── mask_utils.py        # Mask utility functions
-└── training/                # TODO: Training utilities
+└── training/                # ✅ Training utilities (extracted)
+    └── __init__.py          # SSLSegmentationLightning training module
 ```
 
 ## 🎯 Key Improvements
@@ -70,7 +75,7 @@ config = get_default_config('resnet', 'maskrcnn')
 
 ```bash
 # Same interface as original, but with modular imports
-python train_refactored.py --backbone resnet --head maskrcnn --fast_dev_run
+python train.py --backbone resnet --head maskrcnn --fast_dev_run
 ```
 
 ## 🧪 Testing
@@ -85,8 +90,9 @@ python test_imports.py
 
 | Aspect | Original | Refactored |
 |--------|----------|------------|
-| **File count** | 1 monolithic file | 13+ focused modules |
+| **File count** | 1 monolithic file | 17+ focused modules |
 | **Lines per file** | 1755 lines | ~50-300 lines each |
+| **Main train.py** | 1755 lines | 180 lines (90% reduction) |
 | **Maintainability** | ❌ Difficult | ✅ Easy |
 | **Reusability** | ❌ Poor | ✅ Excellent |
 | **Testing** | ❌ Complex | ✅ Modular |
@@ -99,13 +105,14 @@ python test_imports.py
 - [x] **Base classes** - Abstract interfaces for backbones and heads
 - [x] **Backbone models** - 6 different backbone architectures in separate files
 - [x] **Factory functions** - Clean interfaces for creating components
-- [ ] **Head models** - Complex segmentation heads (would need more work)
-- [ ] **Training module** - PyTorch Lightning training logic (would need extraction)
+- [x] **Head models** - Complex segmentation heads (extracted to separate files)
+- [x] **Training module** - PyTorch Lightning training logic (extracted to omniseg/training/)
 
 ## 📝 Notes
 
-- The complex segmentation heads (DETR, ContourFormer) remain in the original file due to their size and complexity
-- This demonstrates the refactoring approach and benefits of modular structure
-- Complete head refactoring would require additional time for the ~1000+ lines of complex model code
+- ✅ **COMPLETED**: All complex segmentation heads (DETR, ContourFormer) have been extracted to separate module files
+- ✅ **COMPLETED**: Training logic has been extracted to the training module  
+- ✅ **COMPLETED**: Original monolithic `train.py` (1755 lines) has been replaced with modular `train.py` (180 lines)
+- The refactoring is now complete with ~1000+ lines of complex model code properly modularized
 
 The refactoring successfully demonstrates how to break down monolithic code into clean, maintainable, and reusable modules while preserving all functionality.

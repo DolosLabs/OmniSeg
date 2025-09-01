@@ -20,17 +20,13 @@ import torchvision.transforms.v2 as T
 # Adjust the Python path to import from your main script
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# Import all necessary classes from train.py
-from train import (
-    SSLMask2Former, GenericMaskRCNN, SSLContourFormer,
-    DinoVisionTransformerBackbone, SamVisionTransformerBackbone, SwinTransformerBackbone,
-    ConvNeXtBackbone, RepVGGBackbone, ResNetBackbone,
-    GenericBackboneWithFPN,
-    SSLContourFormer,
-    SemiCOCODataset, COCODataModule,
-    masks_to_boxes, masks_to_contours, contours_to_masks, get_transforms,
-    SSLSegmentationLightning
-)
+# Import from the modular structure
+from omniseg.config import get_available_backbones, get_default_config
+from omniseg.data import SemiCOCODataset, COCODataModule, get_transforms
+from omniseg.models.backbones import get_backbone
+from omniseg.models.heads import get_head
+from omniseg.models.heads.contourformer import masks_to_contours, contours_to_masks  
+from omniseg.training import SSLSegmentationLightning, masks_to_boxes
 
 
 def visualize_model(checkpoint_path, project_dir, num_images_to_viz=5):
