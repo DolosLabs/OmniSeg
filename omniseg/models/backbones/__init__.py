@@ -5,6 +5,7 @@ from ..base import BaseBackbone
 from ...config import get_available_backbones
 
 # Import backbone implementations
+from .simple import SimpleTestBackbone
 from .dino import DinoVisionTransformerBackbone
 from .sam import SamVisionTransformerBackbone
 from .swin import SwinTransformerBackbone
@@ -16,6 +17,7 @@ from .resnet import ResNetBackbone
 def get_backbone(backbone_type: str, **kwargs) -> BaseBackbone:
     """Factory function to create a backbone instance."""
     backbone_classes = {
+        'simple': SimpleTestBackbone,
         'dino': DinoVisionTransformerBackbone,
         'sam': SamVisionTransformerBackbone,
         'swin': SwinTransformerBackbone,
@@ -33,6 +35,7 @@ def get_backbone(backbone_type: str, **kwargs) -> BaseBackbone:
 
 __all__ = [
     'get_backbone',
+    'SimpleTestBackbone',
     'DinoVisionTransformerBackbone',
     'SamVisionTransformerBackbone', 
     'SwinTransformerBackbone',

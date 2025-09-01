@@ -1,0 +1,170 @@
+{
+  "simple_maskrcnn": {
+    "backbone": "simple",
+    "head": "maskrcnn",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Head failed: targets should not be none when in training mode"
+  },
+  "simple_contourformer": {
+    "backbone": "simple",
+    "head": "contourformer",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Head failed: mat1 and mat2 shapes cannot be multiplied (4096x16 and 256x512)"
+  },
+  "simple_deformable_detr": {
+    "backbone": "simple",
+    "head": "deformable_detr",
+    "status": "working",
+    "instantiation": true,
+    "forward_pass": true,
+    "error": null
+  },
+  "dino_maskrcnn": {
+    "backbone": "dino",
+    "head": "maskrcnn",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Backbone failed: We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.\nCheck your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode'."
+  },
+  "dino_contourformer": {
+    "backbone": "dino",
+    "head": "contourformer",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Backbone failed: We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.\nCheck your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode'."
+  },
+  "dino_deformable_detr": {
+    "backbone": "dino",
+    "head": "deformable_detr",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Backbone failed: We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.\nCheck your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode'."
+  },
+  "sam_maskrcnn": {
+    "backbone": "sam",
+    "head": "maskrcnn",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Backbone failed: We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.\nCheck your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode'."
+  },
+  "sam_contourformer": {
+    "backbone": "sam",
+    "head": "contourformer",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Backbone failed: We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.\nCheck your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode'."
+  },
+  "sam_deformable_detr": {
+    "backbone": "sam",
+    "head": "deformable_detr",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Backbone failed: We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.\nCheck your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode'."
+  },
+  "swin_maskrcnn": {
+    "backbone": "swin",
+    "head": "maskrcnn",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Backbone failed: We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.\nCheck your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode'."
+  },
+  "swin_contourformer": {
+    "backbone": "swin",
+    "head": "contourformer",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Backbone failed: We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.\nCheck your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode'."
+  },
+  "swin_deformable_detr": {
+    "backbone": "swin",
+    "head": "deformable_detr",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Backbone failed: We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.\nCheck your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode'."
+  },
+  "convnext_maskrcnn": {
+    "backbone": "convnext",
+    "head": "maskrcnn",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Backbone failed: An error happened while trying to locate the file on the Hub and we cannot find the requested files in the local cache. Please check your connection and try again or make sure your Internet connection is on."
+  },
+  "convnext_contourformer": {
+    "backbone": "convnext",
+    "head": "contourformer",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Backbone failed: An error happened while trying to locate the file on the Hub and we cannot find the requested files in the local cache. Please check your connection and try again or make sure your Internet connection is on."
+  },
+  "convnext_deformable_detr": {
+    "backbone": "convnext",
+    "head": "deformable_detr",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Backbone failed: An error happened while trying to locate the file on the Hub and we cannot find the requested files in the local cache. Please check your connection and try again or make sure your Internet connection is on."
+  },
+  "repvgg_maskrcnn": {
+    "backbone": "repvgg",
+    "head": "maskrcnn",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Backbone failed: An error happened while trying to locate the file on the Hub and we cannot find the requested files in the local cache. Please check your connection and try again or make sure your Internet connection is on."
+  },
+  "repvgg_contourformer": {
+    "backbone": "repvgg",
+    "head": "contourformer",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Backbone failed: An error happened while trying to locate the file on the Hub and we cannot find the requested files in the local cache. Please check your connection and try again or make sure your Internet connection is on."
+  },
+  "repvgg_deformable_detr": {
+    "backbone": "repvgg",
+    "head": "deformable_detr",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Backbone failed: An error happened while trying to locate the file on the Hub and we cannot find the requested files in the local cache. Please check your connection and try again or make sure your Internet connection is on."
+  },
+  "resnet_maskrcnn": {
+    "backbone": "resnet",
+    "head": "maskrcnn",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Backbone failed: An error happened while trying to locate the file on the Hub and we cannot find the requested files in the local cache. Please check your connection and try again or make sure your Internet connection is on."
+  },
+  "resnet_contourformer": {
+    "backbone": "resnet",
+    "head": "contourformer",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Backbone failed: An error happened while trying to locate the file on the Hub and we cannot find the requested files in the local cache. Please check your connection and try again or make sure your Internet connection is on."
+  },
+  "resnet_deformable_detr": {
+    "backbone": "resnet",
+    "head": "deformable_detr",
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Backbone failed: An error happened while trying to locate the file on the Hub and we cannot find the requested files in the local cache. Please check your connection and try again or make sure your Internet connection is on."
+  }
+}

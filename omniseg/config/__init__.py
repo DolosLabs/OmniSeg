@@ -9,6 +9,7 @@ NUM_CLASSES = 10
 
 # Backbone and Head Configuration
 BACKBONE_CONFIGS = {
+    'simple': {'default_size': 64, 'model_name': 'simple_test_cnn'},
     'dino': {'default_size': 224, 'model_name': 'facebook/dinov3-vitl16-pretrain-lvd1689m'},
     'sam': {'default_size': 1024, 'model_name': 'facebook/sam-vit-huge'},
     'swin': {'default_size': 224, 'model_name': 'microsoft/swin-base-patch4-window7-224-in22k'},
