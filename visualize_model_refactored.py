@@ -24,10 +24,9 @@ from omniseg.models.base import BaseBackbone, BaseHead
 from omniseg.models.backbones import get_backbone
 
 # Import complex classes from original train.py for now
-from train import (
-    SSLSegmentationLightning,
-    masks_to_boxes, masks_to_contours, contours_to_masks
-)
+# Import from the modular structure
+from omniseg.training import SSLSegmentationLightning, masks_to_boxes  
+from omniseg.models.heads.contourformer import masks_to_contours, contours_to_masks
 
 
 def visualize_model(checkpoint_path, project_dir, num_images_to_viz=5):
