@@ -1,6 +1,17 @@
 # train.py
 # Semi-Supervised Instance Segmentation with Multiple Backbones and Heads (PyTorch Lightning Version)
 #
+# This script provides a unified, modular framework for training instance segmentation models
+# with various backbone architectures and segmentation heads. The code has been refactored
+# for better maintainability, extensibility, and consistency.
+#
+# Features:
+# - Multiple backbone support: DINO, SAM, Swin, ConvNeXt, RepVGG, ResNet
+# - Multiple head support: Mask R-CNN, Deformable DETR, ContourFormer
+# - Modular architecture with base classes and factory patterns
+# - Type hints and comprehensive error handling
+# - Semi-supervised learning with teacher-student framework
+#
 # To run this script, first install the required dependencies:
 # pip install transformers torch torchvision tqdm pycocotools pytorch-lightning timm scikit-image scipy
 #
@@ -105,7 +116,7 @@ class BaseHead(ABC):
         pass
 
 
-# --- Step 1: COCO Dataset Utility ---
+# --- COCO Dataset Utilities ---
 def download_coco2017(root_dir=".", splits=['train', 'val', 'test']):
     base_dir = os.path.join(root_dir, 'coco2017')
     annotations_dir = os.path.join(base_dir, 'annotations')
@@ -136,7 +147,7 @@ def download_coco2017(root_dir=".", splits=['train', 'val', 'test']):
     return base_dir
 
 
-# --- Step 2: Model Architecture Definition ---
+# --- Backbone Architectures ---
 class DinoVisionTransformerBackbone(BaseBackbone, nn.Module):
     def __init__(self, model_name: str = None, feature_layer: int = 8, freeze_encoder: bool = True):
         BaseBackbone.__init__(self, freeze_encoder)
@@ -364,6 +375,32 @@ def get_backbone(backbone_type: str, **kwargs) -> BaseBackbone:
                         f"Available options: {list(backbone_classes.keys())}")
     
     return backbone_classes[backbone_type](**kwargs)
+
+
+def get_available_backbones() -> List[str]:
+    """Get list of all available backbone types."""
+    return list(BACKBONE_CONFIGS.keys())
+
+
+def get_available_heads() -> List[str]:
+    """Get list of all available head types.""" 
+    return list(HEAD_CONFIGS.keys())
+
+
+def get_default_config(backbone_type: str, head_type: str) -> Dict[str, Any]:
+    """Get default configuration for a backbone-head combination."""
+    if backbone_type not in BACKBONE_CONFIGS:
+        raise ValueError(f"Unknown backbone: {backbone_type}")
+    if head_type not in HEAD_CONFIGS:
+        raise ValueError(f"Unknown head: {head_type}")
+    
+    return {
+        'backbone': BACKBONE_CONFIGS[backbone_type],
+        'head': HEAD_CONFIGS[head_type],
+        'image_size': BACKBONE_CONFIGS[backbone_type]['default_size'],
+        'batch_size': HEAD_CONFIGS[head_type]['batch_size'],
+        'precision': HEAD_CONFIGS[head_type]['precision']
+    }
 
 # --- Head Architectures ---
 
@@ -1192,7 +1229,7 @@ class COCODataModule(pl.LightningDataModule):
     def collate_fn(self, batch): return tuple(zip(*batch))
 
 
-# --- Step 4: PyTorch Lightning Module ---
+# --- PyTorch Lightning Training Module ---
 class SSLSegmentationLightning(pl.LightningModule):
     def __init__(self, num_classes: int = 80, lr: float = 1e-4, ema_decay: float = 0.999, 
                  backbone_type: str = 'dino', head_type: str = 'maskrcnn', image_size: int = 224, 
@@ -1621,35 +1658,44 @@ class SSLSegmentationLightning(pl.LightningModule):
         if self.hparams.head_type == 'contourformer':
             self.student.criterion.matcher.step_epoch()
 
-# --- Step 5: Main Execution Block ---
+# --- Main Training Script ---
 def main():
     parser = argparse.ArgumentParser(description="Train a Semi-Supervised Instance Segmentation Model.")
-    parser.add_argument('--backbone', type=str, default='dino', choices=['dino', 'sam', 'swin', 'convnext', 'repvgg', 'resnet'], help="Choose the backbone model.")
-    parser.add_argument('--head', type=str, default='maskrcnn', choices=['maskrcnn', 'contourformer', 'deformable_detr'], help="Choose the segmentation head.")
+    parser.add_argument('--backbone', type=str, default='dino', choices=get_available_backbones(), 
+                       help="Choose the backbone model.")
+    parser.add_argument('--head', type=str, default='maskrcnn', choices=get_available_heads(), 
+                       help="Choose the segmentation head.")
     parser.add_argument('--learning_rate', type=float, default=5e-5, help="Learning rate for the optimizer.")
-    parser.add_argument('--image_size', type=int, default=None, help="Custom image size for resizing. Overrides backbone-specific defaults.")
+    parser.add_argument('--image_size', type=int, default=None, 
+                       help="Custom image size for resizing. Overrides backbone-specific defaults.")
     parser.add_argument('--batch_size', type=int, default=None, help="Override the default batch size.")
     parser.add_argument('--num_workers', type=int, default=4, help="Number of workers for data loading.")
-    parser.add_argument('--fast_dev_run', action='store_true', help="Run a single batch for training and validation to check for errors.")
-    parser.add_argument('--max_steps', type=int, default=-1, help="Total number of training steps to perform. Overrides max_epochs.")
-    parser.add_argument('--num_labeled_images', type=int, default=-1, help="Number of labeled images to use for training. -1 for all.")
-    parser.add_argument('--num_unlabeled_images', type=int, default=-1, help="Number of unlabeled images to use for training. -1 for all.")
-    parser.add_argument('--accumulate_grad_batches', type=int, default=1, help="Accumulate gradients over N batches.")
-    parser.add_argument('--find_unused_parameters', action='store_true', help="Enable 'find_unused_parameters' for DDP. May slightly slow down training.")
-    parser.add_argument('--warmup_steps', type=int, default=500, help="Number of initial steps to train on labeled data only.")
-    parser.add_argument('--unsup_rampup_steps', type=int, default=5000, help="Number of steps to ramp up unsupervised loss weight after warmup.")
+    parser.add_argument('--fast_dev_run', action='store_true', 
+                       help="Run a single batch for training and validation to check for errors.")
+    parser.add_argument('--max_steps', type=int, default=-1, 
+                       help="Total number of training steps to perform. Overrides max_epochs.")
+    parser.add_argument('--num_labeled_images', type=int, default=-1, 
+                       help="Number of labeled images to use for training. -1 for all.")
+    parser.add_argument('--num_unlabeled_images', type=int, default=-1, 
+                       help="Number of unlabeled images to use for training. -1 for all.")
+    parser.add_argument('--accumulate_grad_batches', type=int, default=1, 
+                       help="Accumulate gradients over N batches.")
+    parser.add_argument('--find_unused_parameters', action='store_true', 
+                       help="Enable 'find_unused_parameters' for DDP. May slightly slow down training.")
+    parser.add_argument('--warmup_steps', type=int, default=500, 
+                       help="Number of initial steps to train on labeled data only.")
+    parser.add_argument('--unsup_rampup_steps', type=int, default=5000, 
+                       help="Number of steps to ramp up unsupervised loss weight after warmup.")
     parser.add_argument('--val_every_n_epoch', type=int, default=1, help="Run validation every N epochs.")
     args = parser.parse_args()
-
-    if args.backbone == 'sam':
-        default_image_size = 512
-        default_batch_size = 4
-    else:
-        default_image_size = 224
-        default_batch_size = 8
-
-    image_size = args.image_size if args.image_size is not None else default_image_size
-    batch_size = args.batch_size if args.batch_size is not None else default_batch_size
+    
+    # Get default configuration for the backbone-head combination
+    default_config = get_default_config(args.backbone, args.head)
+    
+    # Apply user overrides or use defaults
+    image_size = args.image_size if args.image_size is not None else default_config['image_size']
+    batch_size = args.batch_size if args.batch_size is not None else default_config['batch_size']
+    precision_setting = default_config['precision']
 
     if args.backbone == 'swin':
         swin_model_name = 'microsoft/swin-base-patch4-window7-224-in22k'
@@ -1663,8 +1709,6 @@ def main():
         except Exception as e:
             print(f"Could not perform Swin Transformer validation check. Error: {e}")
 
-    precision_setting = "32" if args.head in ['contourformer', 'deformable_detr'] or args.backbone in ['repvgg', 'resnet'] else "16-mixed"
-
     print("\n--- Configuration ---")
     print(f"  Backbone:        {args.backbone}")
     print(f"  Head:            {args.head}")
@@ -1672,6 +1716,7 @@ def main():
     print(f"  Batch Size:      {batch_size}")
     print(f"  Learning Rate:   {args.learning_rate}")
     print(f"  Precision:       {precision_setting}")
+    print(f"  Model:           {default_config['backbone']['model_name']}")
     print("---------------------\n")
 
     pl.seed_everything(42)
