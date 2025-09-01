@@ -7,8 +7,8 @@
 # Then, execute the script from your terminal using command-line arguments.
 # Examples:
 #    python train.py --backbone resnet --head maskrcnn
-#    python train.py --backbone dino --head contourformer --image_size 384 --learning_rate 1e-4
-#    python train.py --backbone swin --head maskrcnn --image_size 448
+#    python train.py --backbone dino --head contourformer
+#    python train.py --backbone swin --head deformable_detr --image_size 448
 
 import os
 import sys
@@ -37,8 +37,11 @@ import tqdm
 import pytorch_lightning as pl
 from pytorch_lightning.utilities.combined_loader import CombinedLoader
 from pytorch_lightning.callbacks import ModelCheckpoint
-# --- MODIFIED: Removed Mask2Former specific imports ---
-from transformers import (AutoModel, AutoConfig)
+from transformers import (AutoModel, AutoConfig, DeformableDetrConfig, DeformableDetrModel, DeformableDetrImageProcessor)
+from transformers.models.deformable_detr.modeling_deformable_detr import DeformableDetrSinePositionEmbedding
+# --- FIX: Add specific import for BaseModelOutput ---
+from transformers.modeling_outputs import BaseModelOutput
+
 
 from torchvision.models.detection import MaskRCNN
 from torchvision.models.detection.rpn import AnchorGenerator
@@ -91,10 +94,7 @@ class DinoVisionTransformerBackbone(nn.Module):
     def __init__(self, model_name='facebook/dinov3-vitl16-pretrain-lvd1689m', feature_layer=8):
         super().__init__()
         print(f"Loading backbone: {model_name}")
-        # --- DEFINITIVE FIX IS HERE ---
-        # Force the model to load in float32 to let the Trainer manage precision.
         self.dino = AutoModel.from_pretrained(model_name, torch_dtype=torch.float32)
-        # --- END FIX ---
         for p in self.dino.parameters(): p.requires_grad = False
         self.dino.eval(); self.feature_layer_index = feature_layer; self.num_register_tokens = self.dino.config.num_register_tokens
         embed_dim = self.dino.config.hidden_size; decoder_channels = [128, 256, 512, 1024]
@@ -200,8 +200,6 @@ def get_backbone(backbone_type):
     else:
         raise ValueError(f"Unsupported backbone_type: {backbone_type}")
 
-# --- MODIFIED: Removed the SSLMask2Former class ---
-
 class GenericBackboneWithFPN(nn.Module):
     def __init__(self, backbone_type='dino', fpn_out_channels=256, dummy_input_size=224):
         super().__init__()
@@ -223,9 +221,8 @@ class GenericBackboneWithFPN(nn.Module):
                 raise KeyError(f"Expected feature '{k}' from backbone but got keys: {list(feats.keys())}")
             ordered_input[k] = feats[k]
         fpn_out = self.fpn(ordered_input)
-        remapped = OrderedDict()
-        for i, orig_k in enumerate(self._orig_keys):
-            remapped[str(i)] = fpn_out[orig_k]
+        # Remap keys to strings '0', '1', '2', ... for DETR compatibility
+        remapped = OrderedDict([(str(i), val) for i, (key, val) in enumerate(fpn_out.items())])
         return remapped
 
 class GenericMaskRCNN(nn.Module):
@@ -247,7 +244,168 @@ class GenericMaskRCNN(nn.Module):
         return self.model(images, targets)
 
 
+# --- START: Deformable DETR Head ---
+class HungarianMatcherDETR(nn.Module):
+    def __init__(self, cost_class: float = 1, cost_bbox: float = 1, cost_giou: float = 1):
+        super().__init__()
+        self.cost_class = cost_class
+        self.cost_bbox = cost_bbox
+        self.cost_giou = cost_giou
+    @torch.no_grad()
+    def forward(self, outputs, targets):
+        bs, num_queries = outputs["pred_logits"].shape[:2]
+        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)
+        out_bbox = outputs["pred_boxes"].flatten(0, 1)
+        tgt_ids = torch.cat([v["labels"] for v in targets])
+        tgt_bbox = torch.cat([v["boxes"] for v in targets])
+        cost_class = -out_prob[:, tgt_ids]
+        cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
+        cost_giou = -generalized_box_iou(box_convert(out_bbox, in_fmt="cxcywh", out_fmt="xyxy"), box_convert(tgt_bbox, in_fmt="cxcywh", out_fmt="xyxy"))
+        C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+        C = C.view(bs, num_queries, -1).cpu()
+        sizes = [len(v["boxes"]) for v in targets]
+        indices = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
+        return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
+
+def dice_loss(inputs, targets, num_boxes):
+    inputs = inputs.sigmoid().flatten(1)
+    # --- FIX: Flatten the target masks to match the input masks ---
+    targets = targets.flatten(1)
+    
+    numerator = 2 * (inputs * targets).sum(1)
+    denominator = inputs.sum(-1) + targets.sum(-1)
+    loss = 1 - (numerator + 1) / (denominator + 1)
+    return loss.sum() / num_boxes
+
+class SetCriterionDETR(nn.Module):
+    def __init__(self, num_classes, matcher, weight_dict, eos_coef):
+        super().__init__()
+        self.num_classes = num_classes
+        self.matcher = matcher
+        self.weight_dict = weight_dict
+        self.eos_coef = eos_coef
+        empty_weight = torch.ones(self.num_classes + 1)
+        empty_weight[-1] = self.eos_coef
+        self.register_buffer("empty_weight", empty_weight)
+    def _get_src_permutation_idx(self, indices):
+        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
+        src_idx = torch.cat([src for (src, _) in indices])
+        return batch_idx, src_idx
+    def _get_tgt_permutation_idx(self, indices):
+        batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
+        tgt_idx = torch.cat([tgt for (_, tgt) in indices])
+        return batch_idx, tgt_idx
+    def loss_labels(self, outputs, targets, indices, num_boxes):
+        src_logits = outputs['pred_logits']
+        idx = self._get_src_permutation_idx(indices)
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device)
+        target_classes[idx] = target_classes_o
+        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
+        return {"loss_ce": loss_ce}
+    def loss_boxes(self, outputs, targets, indices, num_boxes):
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = outputs['pred_boxes'][idx]
+        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+        loss_giou = 1 - torch.diag(generalized_box_iou(box_convert(src_boxes, in_fmt="cxcywh", out_fmt="xyxy"), box_convert(target_boxes, in_fmt="cxcywh", out_fmt="xyxy")))
+        return {"loss_bbox": loss_bbox.sum() / num_boxes, "loss_giou": loss_giou.sum() / num_boxes}
+    def loss_masks(self, outputs, targets, indices, num_boxes):
+        src_idx = self._get_src_permutation_idx(indices)
+        tgt_idx = self._get_tgt_permutation_idx(indices)
+        src_masks = outputs["pred_masks"][src_idx]
+        target_masks = torch.cat([t['masks'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        loss_mask = F.binary_cross_entropy_with_logits(src_masks, target_masks.to(src_masks.dtype), reduction='none').mean(dim=[1,2])
+        loss_dice = dice_loss(src_masks, target_masks.to(src_masks.dtype), num_boxes)
+        return {"loss_mask": loss_mask.sum() / num_boxes, "loss_dice": loss_dice}
+    def forward(self, outputs, targets):
+        outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+        indices = self.matcher(outputs_without_aux, targets)
+        num_boxes = sum(len(t["labels"]) for t in targets)
+        num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(num_boxes)
+        num_boxes = torch.clamp(num_boxes / (torch.distributed.get_world_size() if torch.distributed.is_available() and torch.distributed.is_initialized() else 1), min=1).item()
+        losses = {}
+        for loss in ['labels', 'boxes', 'masks']:
+            losses.update(getattr(self, f"loss_{loss}")(outputs, targets, indices, num_boxes))
+        if 'aux_outputs' in outputs:
+            for i, aux_outputs in enumerate(outputs['aux_outputs']):
+                indices = self.matcher(aux_outputs, targets)
+                for loss in ['labels', 'boxes', 'masks']:
+                    l_dict = getattr(self, f"loss_{loss}")(aux_outputs, targets, indices, num_boxes)
+                    l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
+                    losses.update(l_dict)
+        return {k: v * self.weight_dict[k.split('_')[0]] for k, v in losses.items() if k.split('_')[0] in self.weight_dict}
+
+class SSLDeformableDETR(nn.Module):
+    def __init__(self, num_classes, backbone_type='dino', image_size=224):
+        super().__init__()
+        self.num_classes = num_classes
+        self.backbone = GenericBackboneWithFPN(backbone_type, fpn_out_channels=256, dummy_input_size=image_size)
+        
+        config = DeformableDetrConfig(num_labels=num_classes)
+        self.detr = DeformableDetrModel(config)
+        
+        self.position_embedding = DeformableDetrSinePositionEmbedding(config.d_model // 2, normalize=True)
+        
+        self.class_embed = nn.Linear(config.d_model, num_classes + 1)
+        self.bbox_embed = nn.Sequential(nn.Linear(config.d_model, config.d_model), nn.ReLU(), nn.Linear(config.d_model, 4))
+        self.mask_head = nn.Sequential(nn.Linear(config.d_model, config.d_model), nn.ReLU(), nn.Linear(config.d_model, 256))
+        self.mask_out_stride = 8
+        self.mask_pred_stride = 4 # From the F.interpolate in the forward pass
+        
+        matcher = HungarianMatcherDETR(cost_class=config.class_cost, cost_bbox=config.bbox_cost, cost_giou=config.giou_cost)
+        weight_dict = {"loss_ce": 1.0, "loss_bbox": config.bbox_loss_coefficient, "loss_giou": config.giou_loss_coefficient, "loss_mask": 1.0, "loss_dice": 1.0}
+        self.criterion = SetCriterionDETR(num_classes, matcher=matcher, weight_dict=weight_dict, eos_coef=config.eos_coefficient)
+
+    def forward(self, pixel_values, pixel_mask=None, targets=None):
+        # 1. Run the backbone and FPN ONCE to get all feature maps.
+        feature_maps = self.backbone(pixel_values)
+        
+        # The DETR model from Hugging Face expects a list of tensors, not a dictionary.
+        features_list = list(feature_maps.values())
+
+        # --- FIX START ---
+        # 2. Create a default pixel_mask if one isn't provided.
+        # The model requires this mask when multi-scale features are passed as a list.
+        if pixel_mask is None:
+            batch_size, _, height, width = pixel_values.shape
+            pixel_mask = torch.ones((batch_size, height, width), dtype=torch.long, device=pixel_values.device)
+        # --- FIX END ---
+
+        # 3. Pass the feature maps AND the mask to the DETR transformer.
+        outputs = self.detr(pixel_values=pixel_values, pixel_mask=pixel_mask)
+    
+        decoder_output = outputs.last_hidden_state
+        
+        # Prediction heads
+        logits = self.class_embed(decoder_output)
+        pred_boxes = self.bbox_embed(decoder_output).sigmoid()
+        mask_embeds = self.mask_head(decoder_output)
+    
+        # Reuse the finest feature map for mask prediction
+        fpn_finest = feature_maps['0'] 
+        B, C, H, W = fpn_finest.shape
+        pred_masks = (mask_embeds @ fpn_finest.view(B, C, H * W)).view(B, -1, H, W)
+    
+        outputs = {
+            "pred_logits": logits,
+            "pred_boxes": pred_boxes,
+            "pred_masks": pred_masks,
+            "aux_outputs": [],
+        }
+        
+        if targets is not None:
+            losses = self.criterion(outputs, targets)
+            return outputs, losses
+        return outputs
+
+# --- END: Deformable DETR Head ---
+
+
 # --- START: ContourFormer Head ---
+# ... (rest of ContourFormer code remains unchanged)
 # ------------------------
 # Simple bilinear sampler helper (for grid_sample)
 # ------------------------
@@ -255,10 +413,10 @@ def bilinear_sample(feat, coords):
     # feat: [N, C, H, W], coords: [N, L, 2] in [-1,1]
     N, C, H, W = feat.shape
     L = coords.shape[1]
-    grid = coords.view(N, 1, L, 2)  # treat L as width
-    sampled = F.grid_sample(feat, grid, align_corners=True, mode='bilinear')  # [N, C, 1, L]
-    sampled = sampled.view(N, C, L).permute(0, 2, 1)  # [N, L, C]
-    return sampled  # [N, L, C]
+    grid = coords.view(N, 1, L, 2)
+    sampled = F.grid_sample(feat, grid, align_corners=True, mode='bilinear')
+    sampled = sampled.view(N, C, L).permute(0, 2, 1)
+    return sampled
 
 
 # ------------------------
@@ -271,72 +429,39 @@ class DeformableCrossAttention(nn.Module):
         self.n_heads = n_heads
         self.n_points = n_points
         self.head_dim = d_model // n_heads
-
-        # Linear layers for q, k, v
         self.to_q = nn.Linear(d_model, d_model)
         self.to_kv = nn.Linear(d_model, 2 * d_model)
-
-        # **This is the missing module**
         self.offset_mlp = nn.Sequential(
             nn.Linear(self.head_dim, self.head_dim),
             nn.ReLU(),
-            nn.Linear(self.head_dim, n_points * 2)  # predicts x,y offsets for each point
+            nn.Linear(self.head_dim, n_points * 2)
         )
-
-        # FIX: Add a final projection layer to match the d_model dimension for the residual connection
         self.output_proj = nn.Linear(d_model, d_model)
 
     def forward(self, query, memory, reference_points, spatial_shape):
-        """
-        query: [N, Len_q, d_model]
-        memory: [N, H*W, d_model]
-        reference_points: [N, Len_q, n_heads, 2] (normalized coordinates x,y)
-        spatial_shape: tuple (H, W)
-        """
         N, Len_q, _ = query.shape
-
-        # 1. Linear projections
-        q = self.to_q(query)  # [N, Len_q, d_model]
-        kv = self.to_kv(memory)  # [N, H*W, 2*d_model]
-        k, v = kv.chunk(2, dim=-1)  # [N, H*W, d_model] each
-
-        # 2. Reshape for multi-head
+        q = self.to_q(query)
+        kv = self.to_kv(memory)
+        k, v = kv.chunk(2, dim=-1)
         q = q.view(N, Len_q, self.n_heads, self.head_dim)
         k = k.view(N, -1, self.n_heads, self.head_dim)
         v = v.view(N, -1, self.n_heads, self.head_dim)
-
-        # 3. Compute offsets
-        offsets = self.offset_mlp(q)  # [N, Len_q, n_heads, n_points*2]
-        offsets = offsets.view(N, Len_q, self.n_heads, self.n_points, 2)  # [N, Len_q, n_heads, n_points, 2]
-
-        # 4. Expand reference points to match offsets
-        if reference_points.dim() == 3:  # [N, Len_q, 2]
-            reference_points = reference_points.unsqueeze(2).unsqueeze(3)  # -> [N, Len_q, 1, 1, 2]
-        elif reference_points.dim() == 4:  # [N, Len_q, n_heads, 2]
-            reference_points = reference_points.unsqueeze(3)  # -> [N, Len_q, n_heads, 1, 2]
-
+        offsets = self.offset_mlp(q)
+        offsets = offsets.view(N, Len_q, self.n_heads, self.n_points, 2)
+        if reference_points.dim() == 3:
+            reference_points = reference_points.unsqueeze(2).unsqueeze(3)
+        elif reference_points.dim() == 4:
+            reference_points = reference_points.unsqueeze(3)
         reference_points = reference_points.expand(-1, -1, self.n_heads, self.n_points, -1)
-
-        # 5. Sampled locations
-        sampling_locations = reference_points + offsets.tanh()  # [N, Len_q, n_heads, n_points, 2]
-
-        # 6. Flatten heads and points for attention
-        q = q.unsqueeze(3).expand(-1, -1, -1, self.n_points, -1)  # [N, Len_q, n_heads, n_points, head_dim]
+        sampling_locations = reference_points + offsets.tanh()
+        q = q.unsqueeze(3).expand(-1, -1, -1, self.n_points, -1)
         q = q.contiguous().view(N, Len_q * self.n_heads * self.n_points, self.head_dim)
         v = v.contiguous().view(N, -1, self.head_dim)
-
-        # 7. Compute attention (simplified for demonstration)
-        # Placeholder should be replaced with actual attention using v and sampling_locations
         attn_output = q
-
-        # 8. Reshape back
         attn_output = attn_output.view(N, Len_q, self.n_heads, self.n_points, self.head_dim)
-        attn_output = attn_output.mean(dim=3)  # average over points
-
-        # FIX: Combine heads and project back to d_model
+        attn_output = attn_output.mean(dim=3)
         attn_output = attn_output.contiguous().view(N, Len_q, self.d_model)
         attn_output = self.output_proj(attn_output)
-
         return attn_output
 
 
@@ -348,11 +473,9 @@ class DeformableDecoderLayer(nn.Module):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.cross_attn = DeformableCrossAttention(d_model, n_heads, n_points)
-
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
-
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
@@ -361,18 +484,13 @@ class DeformableDecoderLayer(nn.Module):
         self.dropout3 = nn.Dropout(dropout)
 
     def forward(self, tgt, memory_feats, reference_points, spatial_shape):
-        # self-attention
         q = k = tgt
         tgt2, _ = self.self_attn(q, k, value=tgt)
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
-
-        # deformable cross-attention
         tgt2 = self.cross_attn(tgt, memory_feats, reference_points, spatial_shape)
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
-
-        # FFN
         tgt2 = self.linear2(self.dropout(F.relu(self.linear1(tgt))))
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
@@ -387,19 +505,12 @@ class SimpleDeformableTransformer(nn.Module):
         )
 
     def forward(self, query_embed, memory_feats, reference_points, spatial_shape):
-        """
-        query_embed: [N, Q, d_model]
-        memory_feats: [N, C, H, W]
-        reference_points: [N, Q, 2] normalized [0,1]
-        spatial_shape: (H, W)
-        returns: hs stacked [num_layers, N, Q, d_model]
-        """
         hs = []
         tgt = query_embed
         for layer in self.decoder_layers:
             tgt = layer(tgt, memory_feats, reference_points, spatial_shape)
             hs.append(tgt)
-        return torch.stack(hs)  # [L, N, Q, d_model]
+        return torch.stack(hs)
 
 
 # ------------------------
@@ -421,40 +532,24 @@ class HungarianMatcher(nn.Module):
 
     @torch.no_grad()
     def forward(self, outputs, targets):
-        """
-        outputs: dict with 'pred_logits': [B, Q, C+1], 'pred_coords': [B, Q, P, 2]
-        targets: list of dicts with 'labels' [num_t], 'coords' [num_t, P, 2]
-        """
         bs, num_queries = outputs["pred_logits"].shape[:2]
-        out_prob = (outputs["pred_logits"].flatten(0, 1) / 0.7).softmax(-1)  # sharpen
-        out_points = outputs["pred_coords"].flatten(0, 1)  # [B*Q, P, 2]
-
+        out_prob = (outputs["pred_logits"].flatten(0, 1) / 0.7).softmax(-1)
+        out_points = outputs["pred_coords"].flatten(0, 1)
         tgt_ids = torch.cat([v["labels"] for v in targets])
         tgt_points = torch.cat([v["coords"] for v in targets])
-
-        # classification cost: negative prob of target class
         cost_class = -out_prob[:, tgt_ids]
-
-        # point cost: flatten points to vector and compute L1
         cost_point = torch.cdist(out_points.flatten(1), tgt_points.flatten(1), p=1)
-
-        # anneal point weight, but allow warmup to be point-only
         if self.epoch < self.warmup_epochs:
-            C = cost_point  # point-only during warmup
+            C = cost_point
         else:
             cost_point_w = max(self.base_cost_point, self.cost_point_init * (self.cost_decay ** self.epoch))
             C = self.base_cost_class * cost_class + cost_point_w * cost_point
-
         C = C.view(bs, num_queries, -1).cpu()
         sizes = [len(v["coords"]) for v in targets]
-
         indices = []
         for i, c in enumerate(C.split(sizes, -1)):
-            # c: [num_queries, num_targets_i]
-            # NOTE: linear_sum_assignment expects numpy array; c is numpy due to .cpu()
             row_ind, col_ind = linear_sum_assignment(c[i].numpy())
             indices.append((torch.as_tensor(row_ind, dtype=torch.int64), torch.as_tensor(col_ind, dtype=torch.int64)))
-
         return indices
 
 
@@ -469,16 +564,14 @@ class SetCriterionContourFormer(nn.Module):
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
         self.num_points = num_points
-
         empty_weight = torch.ones(num_classes + 1)
         empty_weight[-1] = eos_coef
         self.register_buffer('empty_weight', empty_weight)
 
     def loss_labels(self, outputs, targets, indices, num_instances):
-        src_logits = outputs['pred_logits']  # [B, Q, C+1]
+        src_logits = outputs['pred_logits']
         idx = self._get_src_permutation_idx(indices)
         if len(idx[0]) == 0:
-            # no matches
             target_classes_o = torch.empty(0, dtype=torch.int64, device=src_logits.device)
         else:
             target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
@@ -490,11 +583,9 @@ class SetCriterionContourFormer(nn.Module):
     def loss_points(self, outputs, targets, indices, num_instances):
         idx = self._get_src_permutation_idx(indices)
         if len(idx[0]) == 0:
-            # nothing matched
             return {'loss_point': torch.tensor(0., device=next(iter(outputs.values())).device)}
-        src_points = outputs['pred_coords'][idx]  # [sum_matched, P, 2]
+        src_points = outputs['pred_coords'][idx]
         target_points = torch.cat([t['coords'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-        # normalized by num_instances * num_points (num_instances is total GT over batch)
         loss_point = F.l1_loss(src_points, target_points, reduction='sum') / (num_instances * self.num_points)
         return {'loss_point': loss_point}
 
@@ -506,16 +597,8 @@ class SetCriterionContourFormer(nn.Module):
         return batch_idx, src_idx
 
     def forward(self, outputs, targets, indices=None):
-        """
-        outputs: dict with 'pred_logits' [B, Q, C+1] and 'pred_coords' [B, Q, P, 2]
-        targets: list of dicts with 'labels' and 'coords'
-        indices: optional precomputed matching indices (will compute if None)
-        """
-
-        # compute matching on final layer if not provided
         if indices is None:
             indices = self.matcher(outputs, targets)
-
         num_instances = sum(len(t["labels"]) for t in targets)
         num_instances = torch.as_tensor([num_instances], dtype=torch.float, device=next(iter(outputs.values())).device)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -524,11 +607,9 @@ class SetCriterionContourFormer(nn.Module):
         else:
             world_size = 1
         num_instances = torch.clamp(num_instances / world_size, min=1).item()
-
         losses = {}
         losses.update(self.loss_labels(outputs, targets, indices, num_instances))
         losses.update(self.loss_points(outputs, targets, indices, num_instances))
-        # weight the losses
         return {k: v * self.weight_dict.get(k, 1.0) for k, v in losses.items()}
 
 
@@ -543,22 +624,16 @@ class SSLContourFormer(nn.Module):
         self.num_queries = num_queries
         self.num_points = num_points
         self.hidden_dim = hidden_dim
-
-        # Keep your backbone (expects FPN output dict with '0' as a high-res level)
         self.backbone = GenericBackboneWithFPN(backbone_type, fpn_out_channels=hidden_dim, dummy_input_size=image_size)
         self.input_proj = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
-        # learnable normalized reference points per query (sigmoid to [0,1])
         self.ref_point_embed = nn.Embedding(num_queries, 2)
-
-        # deformable decoder
         self.transformer = SimpleDeformableTransformer(d_model=hidden_dim, nheads=nheads,
                                                        num_decoder_layers=num_decoder_layers, n_points=n_points)
         self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.coord_embed = nn.Linear(hidden_dim, num_points * 2)
-
         matcher = HungarianMatcher(cost_class=1, cost_point=5, cost_giou=2, cost_point_init=10, cost_decay=0.95, warmup_epochs=10)
-        weight_dict = {'loss_ce': 1.0, 'loss_point': 1.0}  # safer defaults
+        weight_dict = {'loss_ce': 1.0, 'loss_point': 1.0}
         self.criterion = SetCriterionContourFormer(num_classes, matcher=matcher, weight_dict=weight_dict, eos_coef=0.1, num_points=num_points)
 
     def build_position_encoding(self, feature):
@@ -579,156 +654,83 @@ class SSLContourFormer(nn.Module):
         return pos
 
     def forward(self, pixel_values, targets=None):
-        """
-        If training and targets provided: returns (out, losses) where out is final predictions dict,
-        and losses is dict with main + aux_x keys for deep supervision.
-        Otherwise returns out dict with final predictions.
-        """
         features = self.backbone(pixel_values)
-        src = self.input_proj(features['0'])  # [B, C, H, W]
+        src = self.input_proj(features['0'])
         B, C, H, W = src.shape
-
         pos_embed = self.build_position_encoding(src)
-        # add pos only for visualization / optional (deformable uses reference points)
         src_with_pos = src + pos_embed
-
-        # prepare embeddings
-        query_input = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)  # [B, Q, C]
-        ref_points = self.ref_point_embed.weight.unsqueeze(0).repeat(B, 1, 1).sigmoid()  # [B, Q, 2]
-
-        # transformer -> hs: [num_layers, B, Q, C]
+        query_input = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)
+        ref_points = self.ref_point_embed.weight.unsqueeze(0).repeat(B, 1, 1).sigmoid()
         hs = self.transformer(query_input, src, ref_points, (H, W))
-
-        outputs_classes = [self.class_embed(h) for h in hs]  # list of [B, Q, num_classes+1]
+        outputs_classes = [self.class_embed(h) for h in hs]
         outputs_coords = [self.coord_embed(h).sigmoid().view(B, self.num_queries, self.num_points, 2) for h in hs]
-
         out = {'pred_logits': outputs_classes[-1], 'pred_coords': outputs_coords[-1]}
-
         if self.training and targets is not None:
-            # Use matching from final layer
             indices = self.criterion.matcher(out, targets)
-            # main loss on final layer using precomputed indices
             losses = self.criterion(out, targets, indices=indices)
-
-            # aux losses for intermediate layers (exclude last)
             for i, (c, p) in enumerate(zip(outputs_classes[:-1], outputs_coords[:-1])):
                 aux_out = {'pred_logits': c, 'pred_coords': p}
                 aux_losses = self.criterion(aux_out, targets, indices=indices)
-                # suffix aux index
                 for k, v in aux_losses.items():
                     losses[f"{k}_aux{i}"] = v
             return out, losses
-
         return out
+# --- END: ContourFormer Head ---
 
 
 # --- Step 3: Data Handling ---
 # --- START: ContourFormer Utilities ---
 def masks_to_contours(masks, num_points=50):
-    """Convert binary masks to fixed-size contour point sets.
-    
-    Extracts the most significant contour from each mask and ensures
-    proper polygon closing and robust point sampling for accurate reconstruction.
-    Handles multiple contours by selecting the most representative one.
-    """
+    """Convert binary masks to fixed-size contour point sets."""
     contours_list, valid_indices = [], []
     for i, mask in enumerate(masks):
-        # Skip empty masks
-        if mask.sum() == 0:
-            continue
-            
+        if mask.sum() == 0: continue
         mask_np = mask.cpu().numpy().astype(np.uint8)
         contours = find_contours(mask_np, 0.5)
-        if not contours:
-            continue
-        
-        # Find the most representative contour
-        # Sort by length and use the longest one, but ensure it's meaningful
+        if not contours: continue
         sorted_contours = sorted(contours, key=lambda x: len(x), reverse=True)
         contour = sorted_contours[0]
-        
-        # Skip contours that are too small to be meaningful
-        if len(contour) < 4:
-            continue
-            
-        # Flip coordinates to (x, y) format and ensure proper data type
+        if len(contour) < 4: continue
         contour = np.flip(contour, axis=1).astype(np.float64)
-        
-        # Explicitly close the polygon if not already closed
         if not np.allclose(contour[0], contour[-1], atol=1e-6):
             contour = np.vstack([contour, contour[0:1]])
-        
         contour = torch.tensor(contour, dtype=torch.float32)
-        
-        # Normalize coordinates to [0, 1] range with bounds checking
         contour[:, 0] = torch.clamp(contour[:, 0] / max(mask.shape[1], 1), 0.0, 1.0)
         contour[:, 1] = torch.clamp(contour[:, 1] / max(mask.shape[0], 1), 0.0, 1.0)
-        
-        # Compute path distances for uniform sampling
         path = contour.t()
         diffs = path[:, 1:] - path[:, :-1]
         distances = torch.sqrt(torch.sum(diffs**2, dim=0))
         distance = torch.cumsum(distances, dim=0)
         distance = torch.cat([torch.tensor([0.0]), distance])
-        
-        # Skip degenerate contours (too short perimeter)
-        if distance[-1] < 1e-6:
-            continue
-            
-        # Sample points uniformly along the contour with better interpolation
+        if distance[-1] < 1e-6: continue
         try:
             f = interp1d(distance.numpy(), path.numpy(), kind='linear', axis=1, fill_value="extrapolate")
             new_distances = np.linspace(0, distance[-1].item(), num_points)
             sampled_points = torch.from_numpy(f(new_distances).T).to(torch.float32)
         except:
-            # Fallback: if interpolation fails, use simple resampling
             indices = torch.linspace(0, len(contour)-1, num_points).long()
             indices = torch.clamp(indices, 0, len(contour)-1)
             sampled_points = contour[indices]
-        
-        # Ensure sampled points are properly bounded and handle any numerical issues
         sampled_points = torch.clamp(sampled_points, 0.0, 1.0)
-        
-        # Verify we have valid points
-        if torch.isnan(sampled_points).any() or torch.isinf(sampled_points).any():
-            continue
-            
+        if torch.isnan(sampled_points).any() or torch.isinf(sampled_points).any(): continue
         contours_list.append(sampled_points)
         valid_indices.append(i)
-        
-    if not contours_list:
-        return None, None
+    if not contours_list: return None, None
     return torch.stack(contours_list), valid_indices
 
 def contours_to_masks(contours, img_shape):
-    """Convert sets of contour points to binary masks.
-    
-    Handles coordinate rounding, out-of-bounds points, and empty contours
-    to ensure robust mask reconstruction, with special handling for small polygons.
-    """
+    """Convert sets of contour points to binary masks."""
     h, w = img_shape
     masks = []
-    
     for contour_set in contours:
-        # Skip empty contours
         if contour_set.numel() == 0:
-            masks.append(torch.zeros(h, w, dtype=torch.bool))
-            continue
-            
+            masks.append(torch.zeros(h, w, dtype=torch.bool)); continue
         points = contour_set.clone()
-        
-        # Denormalize coordinates with careful bounds checking
-        points[:, 0] = torch.clamp(points[:, 0] * w, 0, w - 0.01)  # Slight margin to avoid edge issues
+        points[:, 0] = torch.clamp(points[:, 0] * w, 0, w - 0.01)
         points[:, 1] = torch.clamp(points[:, 1] * h, 0, h - 0.01)
-        
-        # Convert to numpy
         points_np = points.cpu().numpy()
-        
-        # For very small contours, be more conservative about rounding
         if len(points_np) <= 10 or np.ptp(points_np[:, 0]) < 2 or np.ptp(points_np[:, 1]) < 2:
-            # Small polygon: keep more precision and ensure minimum size
             points_rounded = points_np
-            # Ensure at least a 3x3 area for very small objects
             if np.ptp(points_np[:, 0]) < 1:
                 center_x = np.mean(points_np[:, 0])
                 points_rounded[:, 0] = np.linspace(center_x - 1, center_x + 1, len(points_np))
@@ -737,50 +739,28 @@ def contours_to_masks(contours, img_shape):
                 points_rounded[:, 1] = np.linspace(center_y - 1, center_y + 1, len(points_np))
         else:
             points_rounded = np.round(points_np).astype(np.float64)
-        
-        # Remove consecutive duplicate points to avoid PIL polygon issues
         unique_points = [points_rounded[0]]
         for point in points_rounded[1:]:
-            if not np.allclose(point, unique_points[-1], atol=0.5):
-                unique_points.append(point)
-        
-        # Ensure polygon is closed
+            if not np.allclose(point, unique_points[-1], atol=0.5): unique_points.append(point)
         if len(unique_points) >= 3 and not np.allclose(unique_points[0], unique_points[-1], atol=0.5):
             unique_points.append(unique_points[0])
-        
         if len(unique_points) < 3:
-            # Not enough points for a valid polygon - create a minimal square
             center_x, center_y = np.mean(points_np[:, 0]), np.mean(points_np[:, 1])
-            unique_points = [
-                [center_x - 1, center_y - 1],
-                [center_x + 1, center_y - 1], 
-                [center_x + 1, center_y + 1],
-                [center_x - 1, center_y + 1],
-                [center_x - 1, center_y - 1]
-            ]
-            
-        # Flatten points for PIL polygon drawing
+            unique_points = [[center_x - 1, center_y - 1],[center_x + 1, center_y - 1],[center_x + 1, center_y + 1],[center_x - 1, center_y + 1],[center_x - 1, center_y - 1]]
         points_flat = np.array(unique_points).flatten().tolist()
-        
         try:
-            # Create mask using PIL polygon drawing
             img = Image.new('L', (w, h), 0)
             ImageDraw.Draw(img).polygon(points_flat, outline=1, fill=1)
-            mask = torch.from_numpy(np.array(img)).bool()
-            masks.append(mask)
+            masks.append(torch.from_numpy(np.array(img)).bool())
         except Exception as e:
-            # Handle any drawing errors gracefully by creating a minimal mask
             print(f"Warning: Error drawing polygon: {e}")
             center_x, center_y = int(np.mean(points_np[:, 0])), int(np.mean(points_np[:, 1]))
             mask = torch.zeros(h, w, dtype=torch.bool)
-            # Create a small square around the center
             for dx in range(-1, 2):
                 for dy in range(-1, 2):
                     x, y = center_x + dx, center_y + dy
-                    if 0 <= x < w and 0 <= y < h:
-                        mask[y, x] = True
+                    if 0 <= x < w and 0 <= y < h: mask[y, x] = True
             masks.append(mask)
-    
     return torch.stack(masks) if masks else torch.empty(0, h, w, dtype=torch.bool)
 # --- END: ContourFormer Utilities ---
 
@@ -873,15 +853,19 @@ class SSLSegmentationLightning(pl.LightningModule):
     def __init__(self, num_classes=80, lr=1e-4, ema_decay=0.999, backbone_type='dino', head_type='maskrcnn', image_size=224, warmup_steps=500, unsup_rampup_steps=5000):
         super().__init__()
         self.save_hyperparameters()
-        # --- MODIFIED: Removed Mask2Former logic ---
         if self.hparams.head_type == 'maskrcnn':
             self.student = GenericMaskRCNN(num_classes, backbone_type=self.hparams.backbone_type, image_size=self.hparams.image_size)
         elif self.hparams.head_type == 'contourformer':
              self.student = SSLContourFormer(num_classes, backbone_type=self.hparams.backbone_type, image_size=self.hparams.image_size,hidden_dim=32)
+        elif self.hparams.head_type == 'deformable_detr':
+             self.student = SSLDeformableDETR(num_classes, backbone_type=self.hparams.backbone_type, image_size=self.hparams.image_size)
         else: raise ValueError(f"Unsupported head_type: {self.hparams.head_type}")
         self.teacher = copy.deepcopy(self.student)
         for p in self.teacher.parameters(): p.requires_grad = False
         self.teacher.eval()
+        if self.hparams.head_type == 'deformable_detr':
+            self.detr_image_processor = DeformableDetrImageProcessor.from_pretrained("SenseTime/deformable-detr")
+
         self.train_aug = get_transforms(augment=True, image_size=self.hparams.image_size)
         self.val_aug = get_transforms(augment=False, image_size=self.hparams.image_size)
         self.validation_step_outputs = []; self.validation_step_losses = []
@@ -891,15 +875,174 @@ class SSLSegmentationLightning(pl.LightningModule):
         for t_param, s_param in zip(self.teacher.parameters(), self.student.parameters()):
             t_param.data.mul_(self.hparams.ema_decay).add_(s_param.data, alpha=1 - self.hparams.ema_decay)
     def on_before_optimizer_step(self, optimizer): self._update_teacher()
+    
     def training_step(self, batch, batch_idx):
-        # --- MODIFIED: Removed Mask2Former logic ---
         if self.hparams.head_type == 'maskrcnn': return self._training_step_mrcnn(batch, batch_idx)
         elif self.hparams.head_type == 'contourformer': return self._training_step_cf(batch, batch_idx)
+        elif self.hparams.head_type == 'deformable_detr': return self._training_step_detr(batch, batch_idx)
+    
     def validation_step(self, batch, batch_idx):
-        # --- MODIFIED: Removed Mask2Former logic ---
         if self.hparams.head_type == 'maskrcnn': self._validation_step_mrcnn(batch, batch_idx)
         elif self.hparams.head_type == 'contourformer': self._validation_step_cf(batch, batch_idx)
+        elif self.hparams.head_type == 'deformable_detr': return self._validation_step_detr(batch, batch_idx)
 
+    def _training_step_detr(self, batch, batch_idx):
+        # ---------------------------
+        # 1. Labeled data (supervised)
+        # ---------------------------
+        images_l, targets_l = batch["labeled"]
+        pixel_values_l = torch.stack([self.train_aug(img, None)[0] for img in images_l]).to(device=self.device, dtype=self.dtype)
+    
+        targets_l_detr = []
+        h, w = self.hparams.image_size, self.hparams.image_size
+        for target in targets_l:
+            boxes_xyxy = masks_to_boxes(target["masks"])
+            boxes_cxcywh = box_convert(boxes_xyxy, in_fmt="xyxy", out_fmt="cxcywh")
+            boxes_cxcywh[:, 0::2] /= w
+            boxes_cxcywh[:, 1::2] /= h
+            mask_target_size = (h // 2, w // 2)
+            resized_masks = F.interpolate(target["masks"].unsqueeze(1), size=mask_target_size, mode="bilinear", align_corners=False).squeeze(1)
+            targets_l_detr.append({
+                "labels": target["labels"].to(self.device),
+                "boxes": boxes_cxcywh.to(self.device),
+                "masks": resized_masks.to(self.device)
+            })
+    
+        _, losses_sup = self.student(pixel_values=pixel_values_l, targets=targets_l_detr)
+    
+        # Ensure loss_sup is always a tensor
+        if isinstance(losses_sup, dict) and losses_sup:
+            loss_sup = sum(losses_sup.values())
+            if not torch.is_tensor(loss_sup):
+                loss_sup = torch.tensor(loss_sup, device=self.device, requires_grad=True)
+        else:
+            loss_sup = torch.tensor(0.0, device=self.device, requires_grad=True)
+    
+        # ---------------------------
+        # 2. Warmup handling
+        # ---------------------------
+        if self.global_step < self.hparams.warmup_steps:
+            self.log_dict({
+                "train_loss": loss_sup,
+                "sup_loss": loss_sup,
+                "unsup_loss": torch.tensor(0.0, device=self.device, dtype=loss_sup.dtype)
+            }, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+            return {"loss": loss_sup}
+    
+        # ---------------------------
+        # 3. Unlabeled data (unsupervised)
+        # ---------------------------
+        images_u, _ = batch["unlabeled"]
+        images_u_weak = torch.stack([self.val_aug(img, None)[0] for img in images_u]).to(device=self.device, dtype=self.dtype)
+    
+        with torch.no_grad():
+            teacher_preds = self.teacher(pixel_values=images_u_weak)
+    
+        pseudo_keep_threshold = 0.5
+        student_input_images, pseudo_targets = [], []
+    
+        for i, img in enumerate(images_u):
+            scores = teacher_preds['pred_logits'][i].softmax(-1)
+            max_scores, labels = scores[..., :-1].max(-1)
+            keep = max_scores > pseudo_keep_threshold
+            if keep.sum() > 0:
+                pseudo_target = {
+                    "labels": labels[keep],
+                    "boxes": teacher_preds['pred_boxes'][i][keep]
+                }
+                student_img, _ = self.train_aug(img, None)
+                student_input_images.append(student_img)
+                pseudo_targets.append({k: v.to(self.device) for k, v in pseudo_target.items()})
+    
+        # Default unsupervised loss tensor
+        loss_unsup = torch.tensor(0.0, device=self.device, dtype=loss_sup.dtype, requires_grad=True)
+    
+        if student_input_images:
+            pixel_values_u = torch.stack(student_input_images).to(device=self.device, dtype=self.dtype)
+    
+            # Provide dummy masks to match DETR input
+            mask_h = self.hparams.image_size // 4
+            mask_w = self.hparams.image_size // 4
+            _, losses_unsup = self.student(
+                pixel_values=pixel_values_u,
+                targets=[{
+                    **t,
+                    'masks': torch.zeros(t['labels'].shape[0], mask_h, mask_w, device=self.device)
+                } for t in pseudo_targets]
+            )
+            if losses_unsup:
+                loss_unsup = sum(losses_unsup.values())
+                if not torch.is_tensor(loss_unsup):
+                    loss_unsup = torch.tensor(loss_unsup, device=self.device, dtype=loss_sup.dtype, requires_grad=True)
+    
+        # ---------------------------
+        # 4. Combine losses with ramp-up
+        # ---------------------------
+        steps_after_warmup = self.global_step - self.hparams.warmup_steps
+        unsup_weight = min(1.0, steps_after_warmup / self.hparams.unsup_rampup_steps)
+        total_loss = loss_sup + unsup_weight * loss_unsup
+    
+        # ---------------------------
+        # 5. Logging
+        # ---------------------------
+        self.log_dict({
+            "train_loss": total_loss,
+            "sup_loss": loss_sup,
+            "unsup_loss": loss_unsup,
+            "unsup_w": unsup_weight
+        }, on_step=True, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+    
+        # ---------------------------
+        # 6. Return for Lightning
+        # ---------------------------
+        return {"loss": total_loss}
+
+
+
+    def _validation_step_detr(self, batch, batch_idx):
+        images, targets = batch
+    
+        # apply validation transforms + batch
+        pixel_values = torch.stack([
+            self.val_aug(img) for img in images
+        ]).to(device=self.device, dtype=self.dtype)
+    
+        # forward pass
+        outputs = self.student(pixel_values)
+    
+        # --- Resize pred masks to target mask size ---
+        # DETR-style mask heads usually produce (B, num_queries, H_pred, W_pred)
+        pred_masks = outputs["pred_masks"]
+    
+        # ensure correct shape for interpolate: (B*num_queries, 1, H_pred, W_pred)
+        B, Q, H, W = pred_masks.shape
+        pred_masks = pred_masks.reshape(B * Q, 1, H, W)
+    
+        # resize to ground truth resolution
+        target_size = targets[0]['masks'].shape[-2:]  # (H, W)
+        pred_masks = F.interpolate(
+            pred_masks, size=target_size, mode="bilinear", align_corners=False
+        )
+    
+        # back to (B, Q, H, W)
+        pred_masks = pred_masks.reshape(B, Q, *target_size)
+    
+        # extract target info
+        orig_sizes = [tuple(t['masks'].shape[1:]) for t in targets]  # (h, w)
+        img_ids = [t['image_id'] for t in targets]
+    
+        # return what your criterion / evaluator needs
+        return {
+            "outputs": outputs,
+            "targets": targets,
+            "pred_masks": pred_masks,
+            "orig_sizes": orig_sizes,
+            "img_ids": img_ids,
+        }
+
+
+
+    
     def _training_step_cf(self, batch, batch_idx):
         images_l, targets_l = batch["labeled"]
         images_l_strong, targets_l_cf = [], []
@@ -914,19 +1057,14 @@ class SSLSegmentationLightning(pl.LightningModule):
             targets_l_cf.append({k: v.to(self.device) for k, v in {'labels': target_cf['labels'], 'coords': coords_aug}.items()})
         loss_sup = torch.tensor(0.0, device=self.device)
         if images_l_strong:
-            # --- MODIFIED: Added .to(device=self.device) ---
             pixel_values_l = torch.stack(images_l_strong).to(device=self.device, dtype=self.dtype)
-            student_preds_l = self.student(pixel_values=pixel_values_l)
-            
-            preds_for_loss = {k: v.float() for k, v in student_preds_l.items()}
-            losses_sup = self.student.criterion(preds_for_loss, targets_l_cf)
+            _, losses_sup = self.student(pixel_values=pixel_values_l, targets=targets_l_cf)
             loss_sup = sum(losses_sup.values())
 
         if self.global_step < self.hparams.warmup_steps:
             self.log_dict({"train_loss": loss_sup, "sup_loss": loss_sup, "unsup_loss": 0}, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=len(images_l), sync_dist=True)
             return loss_sup
         images_u, _ = batch["unlabeled"]
-        # --- MODIFIED: Added .to(device=self.device) ---
         images_u_weak = torch.stack([self.val_aug(img, None)[0] for img in images_u]).to(device=self.device, dtype=self.dtype)
         with torch.no_grad(): teacher_preds = self.teacher(pixel_values=images_u_weak)
         pseudo_keep_threshold = min(0.7, 0.2 + (self.global_step - self.hparams.warmup_steps) / 20000)
@@ -944,12 +1082,8 @@ class SSLSegmentationLightning(pl.LightningModule):
             pseudo_targets.append({k: v.to(self.device) for k, v in {'labels': pseudo_target['labels'], 'coords': coords_aug}.items()})
         loss_unsup = torch.tensor(0.0, device=self.device)
         if student_input_images:
-            # --- MODIFIED: Added .to(device=self.device) ---
             pixel_values_u = torch.stack(student_input_images).to(device=self.device, dtype=self.dtype)
-            student_preds_u = self.student(pixel_values=pixel_values_u)
-            
-            preds_for_loss_u = {k: v.float() for k, v in student_preds_u.items()}
-            losses_unsup = self.student.criterion(preds_for_loss_u, pseudo_targets)
+            _, losses_unsup = self.student(pixel_values=pixel_values_u, targets=pseudo_targets)
             loss_unsup = sum(losses_unsup.values())
 
         steps_after_warmup = self.global_step - self.hparams.warmup_steps
@@ -966,9 +1100,7 @@ class SSLSegmentationLightning(pl.LightningModule):
             contours, valid_indices = masks_to_contours(target['masks'], num_points=self.student.num_points)
             if contours is not None:
                 target_cf = [{'labels': target['labels'][valid_indices].to(self.device), 'coords': contours.to(self.device)}]
-                
-                # --- FIX: Cast predictions to float32 before loss calculation for stability ---
-                outputs_for_loss = {k: v.float() for k, v in outputs.items()}
+                outputs_for_loss = {k: v.float() for k, v in outputs.items() if 'pred' in k}
                 loss_dict = self.student.criterion(outputs_for_loss, target_cf)
                 val_loss = sum(loss_dict.values())
                 self.validation_step_losses.append(val_loss)
@@ -990,8 +1122,6 @@ class SSLSegmentationLightning(pl.LightningModule):
             rle['counts'] = rle['counts'].decode('utf-8')
             coco_formatted_results.append({"image_id": target['image_id'], "category_id": category_id, "segmentation": rle, "score": pred_scores[i].item()})
         self.validation_step_outputs.append(coco_formatted_results)
-
-    # --- MODIFIED: Removed _training_step_m2f and _validation_step_m2f methods ---
 
     def _training_step_mrcnn(self, batch, batch_idx):
         images_l, targets_l = batch["labeled"]; images_l_aug, targets_l_aug = [], []
@@ -1067,8 +1197,7 @@ class SSLSegmentationLightning(pl.LightningModule):
 def main():
     parser = argparse.ArgumentParser(description="Train a Semi-Supervised Instance Segmentation Model.")
     parser.add_argument('--backbone', type=str, default='dino', choices=['dino', 'sam', 'swin', 'convnext', 'repvgg', 'resnet'], help="Choose the backbone model.")
-    # --- MODIFIED: Removed 'mask2former' and updated default ---
-    parser.add_argument('--head', type=str, default='maskrcnn', choices=['maskrcnn', 'contourformer'], help="Choose the segmentation head.")
+    parser.add_argument('--head', type=str, default='maskrcnn', choices=['maskrcnn', 'contourformer', 'deformable_detr'], help="Choose the segmentation head.")
     parser.add_argument('--learning_rate', type=float, default=5e-5, help="Learning rate for the optimizer.")
     parser.add_argument('--image_size', type=int, default=None, help="Custom image size for resizing. Overrides backbone-specific defaults.")
     parser.add_argument('--batch_size', type=int, default=None, help="Override the default batch size.")
@@ -1084,7 +1213,6 @@ def main():
     parser.add_argument('--val_every_n_epoch', type=int, default=1, help="Run validation every N epochs.")
     args = parser.parse_args()
 
-    # --- MODIFIED: Simplified default batch size logic ---
     if args.backbone == 'sam':
         default_image_size = 512
         default_batch_size = 4
@@ -1107,8 +1235,7 @@ def main():
         except Exception as e:
             print(f"Could not perform Swin Transformer validation check. Error: {e}")
 
-    # --- NEW: Conditionally set precision based on the head type ---
-    precision_setting = "32" if args.head == 'contourformer' or args.head == 'repvgg' or args.head == 'resnet' else "16-mixed"
+    precision_setting = "32" if args.head in ['contourformer', 'deformable_detr'] or args.backbone in ['repvgg', 'resnet'] else "16-mixed"
 
     print("\n--- Configuration ---")
     print(f"  Backbone:        {args.backbone}")
@@ -1116,7 +1243,7 @@ def main():
     print(f"  Image Size:      {image_size}x{image_size}")
     print(f"  Batch Size:      {batch_size}")
     print(f"  Learning Rate:   {args.learning_rate}")
-    print(f"  Precision:       {precision_setting}") # Added for clarity
+    print(f"  Precision:       {precision_setting}")
     print("---------------------\n")
 
     pl.seed_everything(42)
@@ -1137,7 +1264,7 @@ def main():
         check_val_every_n_epoch=args.val_every_n_epoch,
         callbacks=[checkpoint_callback],
         log_every_n_steps=10,
-        precision=precision_setting, # --- MODIFIED ---
+        precision=precision_setting,
         default_root_dir=run_dir,
         fast_dev_run=args.fast_dev_run,
         logger=True
