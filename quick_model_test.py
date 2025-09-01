@@ -68,6 +68,7 @@ class QuickModelTester:
             # Test forward pass
             dummy_input = torch.randn(1, 3, 64, 64)
             with torch.no_grad():
+                head.eval()
                 outputs = head(dummy_input)
                 if outputs is not None:
                     result['forward_pass'] = True
