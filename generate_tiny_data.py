@@ -23,11 +23,11 @@ IMAGES_DIR = {
 }
 ANNOTATIONS_DIR = os.path.join(BASE_DIR, "annotations")
 
-CANVAS_SIZE = (128, 128)
+CANVAS_SIZE = (64, 64)
 SHAPES_PER_IMAGE = (2, 5)  # min-max
-N_TRAIN = 100
-N_VAL = 20
-N_TEST = 20
+N_TRAIN = 1000
+N_VAL = 200
+N_TEST = 200
 MIN_MASK_PIXELS = 10  # Skip tiny masks
 
 # Shape categories
