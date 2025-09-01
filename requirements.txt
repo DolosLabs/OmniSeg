@@ -9,4 +9,4 @@ transformers
 accelerate
 timm
 scipy
-scikit-learn
+scikit-image
