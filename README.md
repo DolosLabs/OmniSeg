@@ -62,7 +62,7 @@ python train.py --backbone simple --head deformable_detr --use_tiny_data --fast_
 python train.py --backbone resnet --head maskrcnn
 
 # Example 3: Train with tiny dataset for development
-python train.py --backbone simple --head deformable_detr --use_tiny_data --max_steps 100
+python train.py --backbone dino --head maskrcnn --image_size 64
 ```
 
 ### Advanced Configuration
