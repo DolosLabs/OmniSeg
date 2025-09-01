@@ -7,8 +7,8 @@
 # Then, execute the script from your terminal using command-line arguments.
 # Examples:
 #    python train.py --backbone resnet --head maskrcnn
-#    python train.py --backbone dino --head mask2former --image_size 384 --learning_rate 1e-4
-#    python train.py --backbone swin --head contourformer --image_size 448
+#    python train.py --backbone dino --head contourformer --image_size 384 --learning_rate 1e-4
+#    python train.py --backbone swin --head maskrcnn --image_size 448
 
 import os
 import sys
@@ -37,8 +37,8 @@ import tqdm
 import pytorch_lightning as pl
 from pytorch_lightning.utilities.combined_loader import CombinedLoader
 from pytorch_lightning.callbacks import ModelCheckpoint
-from transformers import (AutoModel, Mask2FormerForUniversalSegmentation,
-                          Mask2FormerImageProcessor, AutoConfig)
+# --- MODIFIED: Removed Mask2Former specific imports ---
+from transformers import (AutoModel, AutoConfig)
 
 from torchvision.models.detection import MaskRCNN
 from torchvision.models.detection.rpn import AnchorGenerator
@@ -200,21 +200,7 @@ def get_backbone(backbone_type):
     else:
         raise ValueError(f"Unsupported backbone_type: {backbone_type}")
 
-class SSLMask2Former(nn.Module):
-    def __init__(self, num_classes, backbone_type='dino'):
-        super().__init__()
-        self.backbone = get_backbone(backbone_type)
-        m2f_pretrained = Mask2FormerForUniversalSegmentation.from_pretrained("facebook/mask2former-swin-base-coco-instance")
-        self.pixel_decoder = m2f_pretrained.model.pixel_level_module.decoder; self.transformer_module = m2f_pretrained.model.transformer_module
-        self.class_predictor = nn.Linear(m2f_pretrained.config.hidden_dim, num_classes + 1)
-        self.config = m2f_pretrained.config; self.criterion = m2f_pretrained.criterion
-    def forward(self, pixel_values):
-        features = self.backbone(pixel_values); raw_backbone_features = [features[f'res{i}'] for i in range(2, 6)]
-        pixel_decoder_outputs = self.pixel_decoder(raw_backbone_features)
-        transformer_outputs = self.transformer_module(pixel_decoder_outputs.multi_scale_features, mask_features=pixel_decoder_outputs.mask_features)
-        class_queries_logits = self.class_predictor(transformer_outputs.last_hidden_state)
-        masks_queries_logits = transformer_outputs.masks_queries_logits[-1]
-        return {"class_queries_logits": class_queries_logits, "masks_queries_logits": masks_queries_logits}
+# --- MODIFIED: Removed the SSLMask2Former class ---
 
 class GenericBackboneWithFPN(nn.Module):
     def __init__(self, backbone_type='dino', fpn_out_channels=256, dummy_input_size=224):
@@ -884,12 +870,11 @@ class COCODataModule(pl.LightningDataModule):
 
 # --- Step 4: PyTorch Lightning Module ---
 class SSLSegmentationLightning(pl.LightningModule):
-    def __init__(self, num_classes=80, lr=1e-4, ema_decay=0.999, backbone_type='dino', head_type='mask2former', image_size=224, warmup_steps=500, unsup_rampup_steps=5000):
+    def __init__(self, num_classes=80, lr=1e-4, ema_decay=0.999, backbone_type='dino', head_type='maskrcnn', image_size=224, warmup_steps=500, unsup_rampup_steps=5000):
         super().__init__()
         self.save_hyperparameters()
-        if self.hparams.head_type == 'mask2former':
-            self.student = SSLMask2Former(num_classes, backbone_type=self.hparams.backbone_type)
-        elif self.hparams.head_type == 'maskrcnn':
+        # --- MODIFIED: Removed Mask2Former logic ---
+        if self.hparams.head_type == 'maskrcnn':
             self.student = GenericMaskRCNN(num_classes, backbone_type=self.hparams.backbone_type, image_size=self.hparams.image_size)
         elif self.hparams.head_type == 'contourformer':
              self.student = SSLContourFormer(num_classes, backbone_type=self.hparams.backbone_type, image_size=self.hparams.image_size,hidden_dim=32)
@@ -897,7 +882,6 @@ class SSLSegmentationLightning(pl.LightningModule):
         self.teacher = copy.deepcopy(self.student)
         for p in self.teacher.parameters(): p.requires_grad = False
         self.teacher.eval()
-        self.image_processor_m2f = Mask2FormerImageProcessor.from_pretrained("facebook/mask2former-swin-base-coco-instance")
         self.train_aug = get_transforms(augment=True, image_size=self.hparams.image_size)
         self.val_aug = get_transforms(augment=False, image_size=self.hparams.image_size)
         self.validation_step_outputs = []; self.validation_step_losses = []
@@ -908,12 +892,12 @@ class SSLSegmentationLightning(pl.LightningModule):
             t_param.data.mul_(self.hparams.ema_decay).add_(s_param.data, alpha=1 - self.hparams.ema_decay)
     def on_before_optimizer_step(self, optimizer): self._update_teacher()
     def training_step(self, batch, batch_idx):
-        if self.hparams.head_type == 'mask2former': return self._training_step_m2f(batch, batch_idx)
-        elif self.hparams.head_type == 'maskrcnn': return self._training_step_mrcnn(batch, batch_idx)
+        # --- MODIFIED: Removed Mask2Former logic ---
+        if self.hparams.head_type == 'maskrcnn': return self._training_step_mrcnn(batch, batch_idx)
         elif self.hparams.head_type == 'contourformer': return self._training_step_cf(batch, batch_idx)
     def validation_step(self, batch, batch_idx):
-        if self.hparams.head_type == 'mask2former': self._validation_step_m2f(batch, batch_idx)
-        elif self.hparams.head_type == 'maskrcnn': self._validation_step_mrcnn(batch, batch_idx)
+        # --- MODIFIED: Removed Mask2Former logic ---
+        if self.hparams.head_type == 'maskrcnn': self._validation_step_mrcnn(batch, batch_idx)
         elif self.hparams.head_type == 'contourformer': self._validation_step_cf(batch, batch_idx)
 
     def _training_step_cf(self, batch, batch_idx):
@@ -1007,77 +991,7 @@ class SSLSegmentationLightning(pl.LightningModule):
             coco_formatted_results.append({"image_id": target['image_id'], "category_id": category_id, "segmentation": rle, "score": pred_scores[i].item()})
         self.validation_step_outputs.append(coco_formatted_results)
 
-    def _training_step_m2f(self, batch, batch_idx):
-        images_l, targets_l = batch["labeled"]
-        images_l_strong, class_labels_l, mask_labels_l = [], [], []
-        for img, target in zip(images_l, targets_l):
-            img_aug, target_aug = self.train_aug(img, target)
-            images_l_strong.append(img_aug)
-            class_labels_l.append(target_aug["labels"])
-            mask_labels_l.append(target_aug["masks"])
-        # --- MODIFIED: Added .to(device=self.device) ---
-        pixel_values_l = torch.stack(images_l_strong).to(device=self.device, dtype=self.dtype)
-        student_preds_l = self.student(pixel_values=pixel_values_l)
-        losses_sup = self.student.criterion(masks_queries_logits=student_preds_l["masks_queries_logits"], class_queries_logits=student_preds_l["class_queries_logits"], mask_labels=[t.to(self.device) for t in mask_labels_l], class_labels=[t.to(self.device) for t in class_labels_l])
-        loss_sup = sum(losses_sup.values())
-        if self.global_step < self.hparams.warmup_steps:
-            self.log_dict({"train_loss": loss_sup, "sup_loss": loss_sup, "unsup_loss": 0}, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=len(images_l), sync_dist=True)
-            return loss_sup
-        images_u, _ = batch["unlabeled"]
-        # --- MODIFIED: Added .to(device=self.device) ---
-        images_u_weak = torch.stack([self.val_aug(img, None)[0] for img in images_u]).to(device=self.device, dtype=self.dtype)
-        with torch.no_grad(): teacher_preds_dict = self.teacher(pixel_values=images_u_weak)
-        teacher_preds = SimpleNamespace(**teacher_preds_dict)
-        teacher_segs = self.image_processor_m2f.post_process_instance_segmentation(teacher_preds, target_sizes=[(self.hparams.image_size, self.hparams.image_size)] * len(images_u))
-        pseudo_keep_threshold = min(0.7, 0.2 + (self.global_step - self.hparams.warmup_steps) / 20000)
-        student_input_images, pseudo_class_labels, pseudo_mask_labels = [], [], []
-        for k, seg in enumerate(teacher_segs):
-            if 'scores' in seg and seg['scores'].numel() > 0:
-                keep = seg['scores'] > pseudo_keep_threshold
-                if keep.sum() == 0: continue
-                pseudo_target_labels = seg['labels'][keep]
-                contiguous_pseudo_labels = torch.tensor([self.trainer.datamodule.cat2label.get(l.item(), -1) for l in pseudo_target_labels], dtype=torch.long, device=self.device)
-                valid_mask = contiguous_pseudo_labels >= 0
-                if valid_mask.sum() == 0: continue
-                pseudo_target = {"labels": contiguous_pseudo_labels[valid_mask], "masks": seg['segmentation'][keep][valid_mask].to(torch.float32)}
-                student_img, transformed_pseudo = self.train_aug(images_u[k], pseudo_target)
-                if transformed_pseudo["labels"].numel() > 0:
-                    student_input_images.append(student_img)
-                    pseudo_class_labels.append(transformed_pseudo["labels"])
-                    pseudo_mask_labels.append(transformed_pseudo["masks"])
-        loss_unsup = torch.tensor(0.0, device=self.device)
-        if student_input_images:
-            # --- MODIFIED: Added .to(device=self.device) ---
-            pixel_values_u = torch.stack(student_input_images).to(device=self.device, dtype=self.dtype)
-            student_preds_u = self.student(pixel_values=pixel_values_u)
-            losses_unsup = self.student.criterion(masks_queries_logits=student_preds_u["masks_queries_logits"], class_queries_logits=student_preds_u["class_queries_logits"], mask_labels=[t.to(self.device) for t in pseudo_mask_labels], class_labels=[t.to(self.device) for t in pseudo_class_labels])
-            loss_unsup = sum(losses_unsup.values())
-        steps_after_warmup = self.global_step - self.hparams.warmup_steps
-        unsup_weight = min(1.0, steps_after_warmup / self.hparams.unsup_rampup_steps)
-        total_loss = loss_sup + unsup_weight * loss_unsup
-        self.log_dict({"train_loss": total_loss, "sup_loss": loss_sup, "unsup_loss": loss_unsup, "unsup_w": unsup_weight}, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=len(images_l), sync_dist=True)
-        return total_loss
-
-    def _validation_step_m2f(self, batch, batch_idx):
-        images, targets = batch; image, target = images[0], targets[0]
-        pixel_values = self.val_aug(image, None)[0].unsqueeze(0).to(device=self.device, dtype=self.dtype)
-        outputs_dict = self.student(pixel_values=pixel_values)
-        with torch.no_grad():
-            class_labels = [target["labels"].to(self.device)]; mask_labels = [target["masks"].to(self.device)]
-            loss_dict = self.student.criterion(masks_queries_logits=outputs_dict["masks_queries_logits"], class_queries_logits=outputs_dict["class_queries_logits"], mask_labels=mask_labels, class_labels=class_labels)
-            val_loss = sum(loss_dict.values()); self.validation_step_losses.append(val_loss)
-        outputs = SimpleNamespace(**outputs_dict)
-        img_info = self.trainer.datamodule.coco_gt_val.loadImgs(target['image_id'])[0]; original_size = (img_info['height'], img_info['width'])
-        results = self.image_processor_m2f.post_process_instance_segmentation(outputs, target_sizes=[original_size])[0]
-        coco_formatted_results = []
-        if results.get('segments_info'):
-            panoptic_map = results['segmentation'].cpu()
-            for seg_info in results['segments_info']:
-                model_label_id = seg_info['label_id']; category_id = self.trainer.datamodule.label2cat[model_label_id]
-                mask = (panoptic_map == seg_info['id']).numpy(); rle = mask_utils.encode(np.asfortranarray(mask))
-                rle['counts'] = rle['counts'].decode('utf-8')
-                coco_formatted_results.append({"image_id": target['image_id'], "category_id": category_id, "segmentation": rle, "score": seg_info['score']})
-        self.validation_step_outputs.append(coco_formatted_results)
+    # --- MODIFIED: Removed _training_step_m2f and _validation_step_m2f methods ---
 
     def _training_step_mrcnn(self, batch, batch_idx):
         images_l, targets_l = batch["labeled"]; images_l_aug, targets_l_aug = [], []
@@ -1150,11 +1064,11 @@ class SSLSegmentationLightning(pl.LightningModule):
             self.student.criterion.matcher.step_epoch()
 
 # --- Step 5: Main Execution Block ---
-# --- Step 5: Main Execution Block ---
 def main():
     parser = argparse.ArgumentParser(description="Train a Semi-Supervised Instance Segmentation Model.")
     parser.add_argument('--backbone', type=str, default='dino', choices=['dino', 'sam', 'swin', 'convnext', 'repvgg', 'resnet'], help="Choose the backbone model.")
-    parser.add_argument('--head', type=str, default='mask2former', choices=['mask2former', 'maskrcnn', 'contourformer'], help="Choose the segmentation head.")
+    # --- MODIFIED: Removed 'mask2former' and updated default ---
+    parser.add_argument('--head', type=str, default='maskrcnn', choices=['maskrcnn', 'contourformer'], help="Choose the segmentation head.")
     parser.add_argument('--learning_rate', type=float, default=5e-5, help="Learning rate for the optimizer.")
     parser.add_argument('--image_size', type=int, default=None, help="Custom image size for resizing. Overrides backbone-specific defaults.")
     parser.add_argument('--batch_size', type=int, default=None, help="Override the default batch size.")
@@ -1170,12 +1084,13 @@ def main():
     parser.add_argument('--val_every_n_epoch', type=int, default=1, help="Run validation every N epochs.")
     args = parser.parse_args()
 
+    # --- MODIFIED: Simplified default batch size logic ---
     if args.backbone == 'sam':
         default_image_size = 512
-        default_batch_size = 4 if args.head in ['maskrcnn', 'contourformer'] else 8
+        default_batch_size = 4
     else:
         default_image_size = 224
-        default_batch_size = 8 if args.head in ['maskrcnn', 'contourformer'] else 24
+        default_batch_size = 8
 
     image_size = args.image_size if args.image_size is not None else default_image_size
     batch_size = args.batch_size if args.batch_size is not None else default_batch_size
@@ -1196,12 +1111,12 @@ def main():
     precision_setting = "32" if args.head == 'contourformer' or args.head == 'repvgg' or args.head == 'resnet' else "16-mixed"
 
     print("\n--- Configuration ---")
-    print(f"  Backbone:       {args.backbone}")
-    print(f"  Head:           {args.head}")
-    print(f"  Image Size:     {image_size}x{image_size}")
-    print(f"  Batch Size:     {batch_size}")
-    print(f"  Learning Rate:  {args.learning_rate}")
-    print(f"  Precision:      {precision_setting}") # Added for clarity
+    print(f"  Backbone:        {args.backbone}")
+    print(f"  Head:            {args.head}")
+    print(f"  Image Size:      {image_size}x{image_size}")
+    print(f"  Batch Size:      {batch_size}")
+    print(f"  Learning Rate:   {args.learning_rate}")
+    print(f"  Precision:       {precision_setting}") # Added for clarity
     print("---------------------\n")
 
     pl.seed_everything(42)
