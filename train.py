@@ -528,43 +528,45 @@ class SetCriterionDETR(nn.Module):
                     losses.update(l_dict)
         return {k: v * self.weight_dict[k] for k, v in losses.items() if k in self.weight_dict}
 
-class SSLDeformableDETR(nn.Module):
-    def __init__(self, num_classes, backbone_type='dino', image_size=224):
-        super().__init__()
-        self.num_classes = num_classes
-        self.backbone = GenericBackboneWithFPN(backbone_type, fpn_out_channels=256, dummy_input_size=image_size)
+class DeformableDETRHead(BaseHead, nn.Module):
+    """Deformable DETR segmentation head."""
+    
+    def __init__(self, num_classes: int, backbone_type: str = 'dino', image_size: int = 224,
+                 d_model: int = 256, num_queries: int = 100, num_decoder_layers: int = 6):
+        BaseHead.__init__(self, num_classes, backbone_type, image_size)
+        nn.Module.__init__(self)
         
-        # DETR configuration
-        self.d_model = 256
-        self.num_queries = 100
+        self.d_model = d_model
+        self.num_queries = num_queries
+        self.backbone = GenericBackboneWithFPN(backbone_type, fpn_out_channels=d_model, dummy_input_size=image_size)
         
         # Query embeddings 
-        self.query_embed = nn.Embedding(self.num_queries, self.d_model)
+        self.query_embed = nn.Embedding(num_queries, d_model)
         
-        # Simple transformer decoder (simplified version of DETR)
+        # Simple transformer decoder
         decoder_layer = nn.TransformerDecoderLayer(
-            d_model=self.d_model,
+            d_model=d_model,
             nhead=8,
             dim_feedforward=2048,
             dropout=0.1,
             batch_first=True
         )
-        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=6)
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
         
         # Prediction heads
-        self.class_embed = nn.Linear(self.d_model, num_classes + 1)
+        self.class_embed = nn.Linear(d_model, num_classes + 1)
         self.bbox_embed = nn.Sequential(
-            nn.Linear(self.d_model, self.d_model),
+            nn.Linear(d_model, d_model),
             nn.ReLU(),
-            nn.Linear(self.d_model, 4)
+            nn.Linear(d_model, 4)
         )
         self.mask_head = nn.Sequential(
-            nn.Linear(self.d_model, self.d_model), 
+            nn.Linear(d_model, d_model), 
             nn.ReLU(),
-            nn.Linear(self.d_model, 256)
+            nn.Linear(d_model, d_model)
         )
         
-        # Loss computation
+        # Loss computation setup
         config = SimpleNamespace(
             class_cost=1.0,
             bbox_cost=5.0,
@@ -593,29 +595,28 @@ class SSLDeformableDETR(nn.Module):
             eos_coef=config.eos_coefficient
         )
 
-    def forward(self, pixel_values, pixel_mask=None, targets=None):
+    def forward(self, pixel_values: torch.Tensor, targets: Optional[List[Dict]] = None) -> Dict[str, torch.Tensor]:
         # 1. Extract backbone features
         feature_maps = self.backbone(pixel_values)
         
         # 2. Use the finest feature map as memory for the transformer
-        finest_features = feature_maps['0']  # Shape: [B, 256, H, W]
+        finest_features = feature_maps['0']  # Shape: [B, d_model, H, W]
         B, C, H, W = finest_features.shape
         
         # Flatten spatial dimensions for transformer
-        memory = finest_features.flatten(2).transpose(1, 2)  # [B, H*W, 256]
+        memory = finest_features.flatten(2).transpose(1, 2)  # [B, H*W, d_model]
         
         # 3. Get query embeddings
-        query_embeds = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)  # [B, num_queries, 256]
+        query_embeds = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)  # [B, num_queries, d_model]
         
         # 4. Apply transformer decoder
-        # Create memory key padding mask (all False since we don't mask any memory positions)
         memory_key_padding_mask = torch.zeros(B, H*W, dtype=torch.bool, device=pixel_values.device)
         
         decoder_output = self.transformer_decoder(
             tgt=query_embeds,
             memory=memory,
             memory_key_padding_mask=memory_key_padding_mask
-        )  # [B, num_queries, 256]
+        )  # [B, num_queries, d_model]
         
         # 5. Apply prediction heads
         logits = self.class_embed(decoder_output)
@@ -850,29 +851,56 @@ class SetCriterionContourFormer(nn.Module):
 
 
 # ------------------------
-# SSLContourFormer using the SimpleDeformableTransformer
+# ContourFormer using the SimpleDeformableTransformer
 # ------------------------
-class SSLContourFormer(nn.Module):
-    def __init__(self, num_classes, backbone_type='dino', image_size=224,
-                 num_queries=100, num_points=50, hidden_dim=256, nheads=8,
-                 num_decoder_layers=6, n_points=4):
-        super().__init__()
+class ContourFormerHead(BaseHead, nn.Module):
+    """ContourFormer segmentation head."""
+    
+    def __init__(self, num_classes: int, backbone_type: str = 'dino', image_size: int = 224,
+                 num_queries: int = 100, num_points: int = 50, hidden_dim: int = 256, 
+                 nheads: int = 8, num_decoder_layers: int = 6, n_points: int = 4):
+        BaseHead.__init__(self, num_classes, backbone_type, image_size)
+        nn.Module.__init__(self)
+        
         self.num_queries = num_queries
         self.num_points = num_points
         self.hidden_dim = hidden_dim
+        
         self.backbone = GenericBackboneWithFPN(backbone_type, fpn_out_channels=hidden_dim, dummy_input_size=image_size)
         self.input_proj = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         self.ref_point_embed = nn.Embedding(num_queries, 2)
-        self.transformer = SimpleDeformableTransformer(d_model=hidden_dim, nheads=nheads,
-                                                       num_decoder_layers=num_decoder_layers, n_points=n_points)
+        
+        self.transformer = SimpleDeformableTransformer(
+            d_model=hidden_dim, 
+            nheads=nheads,
+            num_decoder_layers=num_decoder_layers, 
+            n_points=n_points
+        )
+        
         self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.coord_embed = nn.Linear(hidden_dim, num_points * 2)
-        matcher = HungarianMatcher(cost_class=1, cost_point=5, cost_giou=2, cost_point_init=10, cost_decay=0.95, warmup_epochs=10)
+        
+        # Loss computation setup
+        matcher = HungarianMatcher(
+            cost_class=1, 
+            cost_point=5, 
+            cost_giou=2, 
+            cost_point_init=10, 
+            cost_decay=0.95, 
+            warmup_epochs=10
+        )
         weight_dict = {'loss_ce': 1.0, 'loss_point': 1.0}
-        self.criterion = SetCriterionContourFormer(num_classes, matcher=matcher, weight_dict=weight_dict, eos_coef=0.1, num_points=num_points)
+        self.criterion = SetCriterionContourFormer(
+            num_classes, 
+            matcher=matcher, 
+            weight_dict=weight_dict, 
+            eos_coef=0.1, 
+            num_points=num_points
+        )
 
-    def build_position_encoding(self, feature):
+    def build_position_encoding(self, feature: torch.Tensor) -> torch.Tensor:
+        """Build 2D positional encoding for the feature map."""
         B, C, H, W = feature.shape
         mask = torch.ones(B, H, W, device=feature.device)
         y_embed = mask.cumsum(1, dtype=torch.float32)
@@ -880,6 +908,7 @@ class SSLContourFormer(nn.Module):
         eps = 1e-6
         y_embed = y_embed / (y_embed[:, -1:, :] + eps) * 2 * math.pi
         x_embed = x_embed / (x_embed[:, :, -1:] + eps) * 2 * math.pi
+        
         dim_t = torch.arange(C // 2, device=feature.device)
         dim_t = 10000 ** (2 * (dim_t // 2) / (C // 2))
         pos_x = x_embed[:, :, :, None] / dim_t
@@ -889,21 +918,37 @@ class SSLContourFormer(nn.Module):
         pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
         return pos
 
-    def forward(self, pixel_values, targets=None):
+    def forward(self, pixel_values: torch.Tensor, targets: Optional[List[Dict]] = None) -> Dict[str, torch.Tensor]:
+        # Extract backbone features
         features = self.backbone(pixel_values)
         src = self.input_proj(features['0'])
         B, C, H, W = src.shape
+        
+        # Add positional encoding
         pos_embed = self.build_position_encoding(src)
         src_with_pos = src + pos_embed
+        
+        # Prepare queries and reference points
         query_input = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)
         ref_points = self.ref_point_embed.weight.unsqueeze(0).repeat(B, 1, 1).sigmoid()
+        
+        # Apply transformer
         hs = self.transformer(query_input, src, ref_points, (H, W))
+        
+        # Generate predictions
         outputs_classes = [self.class_embed(h) for h in hs]
         outputs_coords = [self.coord_embed(h).sigmoid().view(B, self.num_queries, self.num_points, 2) for h in hs]
-        out = {'pred_logits': outputs_classes[-1], 'pred_coords': outputs_coords[-1]}
+        
+        out = {
+            'pred_logits': outputs_classes[-1], 
+            'pred_coords': outputs_coords[-1]
+        }
+        
         if self.training and targets is not None:
             indices = self.criterion.matcher(out, targets)
             losses = self.criterion(out, targets, indices=indices)
+            
+            # Add auxiliary losses
             for i, (c, p) in enumerate(zip(outputs_classes[:-1], outputs_coords[:-1])):
                 aux_out = {'pred_logits': c, 'pred_coords': p}
                 aux_losses = self.criterion(aux_out, targets, indices=indices)
@@ -911,10 +956,23 @@ class SSLContourFormer(nn.Module):
                     losses[f"{k}_aux{i}"] = v
             return out, losses
         return out
-# --- END: ContourFormer Head ---
+# --- Head Factory ---
+def get_head(head_type: str, num_classes: int, **kwargs) -> BaseHead:
+    """Factory function to create a segmentation head instance."""
+    head_classes = {
+        'maskrcnn': MaskRCNNHead,
+        'deformable_detr': DeformableDETRHead,
+        'contourformer': ContourFormerHead
+    }
+    
+    if head_type not in head_classes:
+        raise ValueError(f"Unsupported head_type: {head_type}. "
+                        f"Available options: {list(head_classes.keys())}")
+    
+    return head_classes[head_type](num_classes, **kwargs)
 
 
-# --- Step 3: Data Handling ---
+# --- Data Handling ---
 # --- START: ContourFormer Utilities ---
 def masks_to_contours(masks, num_points=50):
     """Convert binary masks to fixed-size contour point sets."""
@@ -1136,21 +1194,29 @@ class COCODataModule(pl.LightningDataModule):
 
 # --- Step 4: PyTorch Lightning Module ---
 class SSLSegmentationLightning(pl.LightningModule):
-    def __init__(self, num_classes=80, lr=1e-4, ema_decay=0.999, backbone_type='dino', head_type='maskrcnn', image_size=224, warmup_steps=500, unsup_rampup_steps=5000):
+    def __init__(self, num_classes: int = 80, lr: float = 1e-4, ema_decay: float = 0.999, 
+                 backbone_type: str = 'dino', head_type: str = 'maskrcnn', image_size: int = 224, 
+                 warmup_steps: int = 500, unsup_rampup_steps: int = 5000):
         super().__init__()
         self.save_hyperparameters()
-        if self.hparams.head_type == 'maskrcnn':
-            self.student = GenericMaskRCNN(num_classes, backbone_type=self.hparams.backbone_type, image_size=self.hparams.image_size)
-        elif self.hparams.head_type == 'contourformer':
-             self.student = SSLContourFormer(num_classes, backbone_type=self.hparams.backbone_type, image_size=self.hparams.image_size,hidden_dim=32)
-        elif self.hparams.head_type == 'deformable_detr':
-             self.student = SSLDeformableDETR(num_classes, backbone_type=self.hparams.backbone_type, image_size=self.hparams.image_size)
-        else: raise ValueError(f"Unsupported head_type: {self.hparams.head_type}")
+        
+        # Create student model using the factory pattern
+        head_kwargs = {
+            'backbone_type': backbone_type,
+            'image_size': image_size
+        }
+        
+        # Add head-specific parameters
+        if head_type == 'contourformer':
+            head_kwargs['hidden_dim'] = 32  # Special case for ContourFormer
+            
+        self.student = get_head(head_type, num_classes, **head_kwargs)
+        
+        # Create teacher model as a copy of student
         self.teacher = copy.deepcopy(self.student)
-        for p in self.teacher.parameters(): p.requires_grad = False
+        for p in self.teacher.parameters():
+            p.requires_grad = False
         self.teacher.eval()
-        if self.hparams.head_type == 'deformable_detr':
-            pass  # No special preprocessing needed anymore
 
         self.train_aug = get_transforms(augment=True, image_size=self.hparams.image_size)
         self.val_aug = get_transforms(augment=False, image_size=self.hparams.image_size)
