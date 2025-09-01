@@ -5,7 +5,7 @@ Pillow
 pycocotools
 tqdm
 pytorch-lightning
-transformers
+git+https://github.com/huggingface/transformers.git
 accelerate
 timm
 scipy
