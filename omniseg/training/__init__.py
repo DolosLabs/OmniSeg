@@ -124,7 +124,7 @@ class SSLSegmentationLightning(pl.LightningModule):
         
         with torch.no_grad():
             outputs = self.student(pixel_values)
-        print(f"DEBUG: Output keys from model are: {outputs.keys()}")
+
         targets_formatted = self._format_targets_for_metric(targets)
         
         # --- FIX: Refactored prediction formatting into helper methods for clarity ---
