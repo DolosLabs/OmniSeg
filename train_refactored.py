@@ -47,93 +47,11 @@ from omniseg.config import (
 from omniseg.data import COCODataModule, download_coco2017, get_transforms
 from omniseg.models.base import BaseBackbone, BaseHead
 from omniseg.models.backbones import get_backbone
+from omniseg.models.heads import get_head
+from omniseg.training import SSLSegmentationLightning
 
-
-# For now, keep the complex head implementations here
-# In a full refactoring, these would be moved to separate files as well
-
-# --- Head Architectures ---
-class GenericBackboneWithFPN(nn.Module):
-    """Generic backbone with Feature Pyramid Network."""
-    
-    def __init__(self, backbone_type: str, image_size: int = 224):
-        super().__init__()
-        self.backbone = get_backbone(backbone_type, image_size=image_size)
-        
-        backbone_channels = self.backbone.output_channels
-        fpn_input_channels = list(backbone_channels.values())[-4:]  # Use last 4 levels
-        
-        self.fpn = FeaturePyramidNetwork(
-            in_channels_list=fpn_input_channels,
-            out_channels=256,
-            extra_blocks=None
-        )
-    
-    def forward(self, x):
-        features = self.backbone(x)
-        # Get the last 4 feature levels for FPN
-        fpn_inputs = OrderedDict()
-        feature_keys = sorted(features.keys())[-4:]
-        for i, key in enumerate(feature_keys):
-            fpn_inputs[str(i)] = features[key]
-        
-        return self.fpn(fpn_inputs)
-
-
-class MaskRCNNHead(BaseHead, nn.Module):
-    """Mask R-CNN head implementation."""
-    
-    def __init__(self, num_classes: int, backbone_type: str = 'dino', image_size: int = 224):
-        BaseHead.__init__(self, num_classes, backbone_type, image_size)
-        nn.Module.__init__(self)
-        
-        self.backbone_fpn = GenericBackboneWithFPN(backbone_type, image_size)
-        
-        anchor_generator = AnchorGenerator(
-            sizes=((32,), (64,), (128,), (256,), (512,)),
-            aspect_ratios=((0.5, 1.0, 2.0),) * 5
-        )
-        
-        self.maskrcnn = MaskRCNN(
-            backbone=self.backbone_fpn,
-            num_classes=num_classes + 1,  # +1 for background
-            rpn_anchor_generator=anchor_generator,
-            box_detections_per_img=100,
-            rpn_pre_nms_top_n_train=2000,
-            rpn_pre_nms_top_n_test=1000,
-            rpn_post_nms_top_n_train=2000,
-            rpn_post_nms_top_n_test=1000
-        )
-    
-    def forward(self, pixel_values: torch.Tensor, targets: Optional[List[Dict]] = None) -> Dict[str, torch.Tensor]:
-        if targets is not None:
-            # Training mode
-            return self.maskrcnn(pixel_values, targets)
-        else:
-            # Inference mode
-            return self.maskrcnn(pixel_values)
-
-
-# For the complex DETR and ContourFormer heads, they would need to be extracted
-# to separate files. For now, we'll include a simplified factory
-
-def get_head(head_type: str, num_classes: int, **kwargs) -> BaseHead:
-    """Factory function to create a head instance."""
-    if head_type == 'maskrcnn':
-        return MaskRCNNHead(num_classes, **kwargs)
-    else:
-        # Import the full original heads for complex ones
-        from train import DeformableDETRHead, ContourFormerHead
-        if head_type == 'deformable_detr':
-            return DeformableDETRHead(num_classes, **kwargs)
-        elif head_type == 'contourformer':
-            return ContourFormerHead(num_classes, **kwargs)
-        else:
-            raise ValueError(f"Unsupported head_type: {head_type}")
-
-
-# Import the full training module for now
-from train import SSLSegmentationLightning
+# The complex head implementations have been extracted to separate files
+# in omniseg/models/heads/
 
 
 # --- Main Training Script ---
