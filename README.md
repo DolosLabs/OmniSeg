@@ -124,24 +124,11 @@ This saves `model_predictions_viz.png` in the same directory.
 
 Here are some sample predictions from different backbones and heads:
 
-<p align="center">
-  <img src="docs/dino_contourformer_predictions_best-model-epoch=06-val_mAP=0.1591.ckpt.png" width="30%" />
-  <br>
-  <em>DINO + ContourFormer</em>
-</p>
-
-<p align="center">
-  <img src="docs/repvgg_maskrcnn_predictions_best-model-epoch=08-val_mAP=0.2596.ckpt.png" width="30%" />
-  <br>
-  <em>RepVGG + Mask R-CNN</em>
-</p>
-
-<p align="center">
-  <img src="docs/dino_maskrcnn_predictions_best-model-epoch=04-val_mAP=0.2618.ckpt.png" width="30%" />
-  <br>
-  <em>DINO + Mask R-CNN</em>
-</p>
-
+| Backbone | Head          | Example Output |
+|----------|---------------|----------------|
+| DINO     | ContourFormer | ![DINO + ContourFormer](docs/dino_contourformer_predictions_best-model-epoch=06-val_mAP=0.1591.ckpt.png) |
+| RepVGG   | Mask R-CNN    | ![RepVGG + Mask R-CNN](docs/repvgg_maskrcnn_predictions_best-model-epoch=08-val_mAP=0.2596.ckpt.png) |
+| DINO     | Mask R-CNN    | ![DINO + Mask R-CNN](docs/dino_maskrcnn_predictions_best-model-epoch=04-val_mAP=0.2618.ckpt.png) |
 ## 🔧 Project Structure
 
 ```
