@@ -6,14 +6,16 @@ A versatile, semi-supervised instance segmentation framework built on PyTorch Li
 
   * **Semi-Supervised Learning (SSL)**: Leverages a teacher-student model architecture to use both labeled and unlabeled data, a crucial technique for training with limited annotations.
   * **Flexible Backbones**: Supports a wide range of popular vision models as backbones, including:
-      * **ViT**: DINO, SAM(In Progress)
-      * **CNN**: ResNet, ConvNeXt, RepVGG
-      * **Hybrid**: Swin Transformer(In Progress)
+      * **ViT**: DINO (Work in Progress), SAM (Work in Progress)
+      * **CNN**: ResNet (Work in Progress), ConvNeXt (Work in Progress), RepVGG (Work in Progress)
+      * **Hybrid**: Swin Transformer (Work in Progress)
+      * **Test**: Simple CNN backbone for testing and development (Working)
   * **Modular Segmentation Heads**: Experiment with different instance segmentation approaches:
-      * **Mask R-CNN**: The classic, widely-used two-stage detector.
-      * **ContourFormer**: A custom head that predicts object contours directly. Error with mAp in progress..
+      * **Mask R-CNN**: The classic, widely-used two-stage detector (Work in Progress)
+      * **ContourFormer**: A custom head that predicts object contours directly (Work in Progress)
+      * **Deformable DETR**: Advanced DETR-based segmentation head (Working)
   * **PyTorch Lightning**: Training and validation are managed by PyTorch Lightning, which simplifies boilerplate code, ensures reproducibility, and supports distributed training.
-  * **Automated Data Handling**: The project automatically downloads and prepares the COCO 2017 dataset, so you can get started quickly.
+  * **Automated Data Handling**: The project automatically downloads and prepares the COCO 2017 dataset, or use the tiny synthetic dataset for quick testing.
 
 ## 🚀 Getting Started
 
@@ -36,11 +38,13 @@ Follow these steps to set up and run OmniSeg.
     pip install -r requirements.txt
     ```
     (Note: You will need to create a `requirements.txt` file from the imports in your code, or manually install them: `pip install transformers torch torchvision tqdm pycocotools pytorch-lightning timm scikit-image scipy`)
-3.  **Prepare the tiny dataset(optional)**:
+3.  **Prepare the tiny dataset (recommended for testing)**:
     ```bash
-    python generate_data.py
+    python generate_tiny_data.py
     ```
-4.  **or Prepare the coco2017 dataset**:
+    This creates a small synthetic dataset with geometric shapes for quick training and testing.
+
+4.  **Or prepare the COCO 2017 dataset**:
     The script automatically handles the download and extraction of the COCO 2017 dataset when you first run it. No manual setup is required.
 
 ## 💻 Usage
@@ -52,14 +56,14 @@ To train a model, use the `train.py` script with command-line arguments to confi
 Train a model with a specified backbone and head. The script will automatically download the dataset if it doesn't exist.
 
 ```bash
-# Example 1: Train a ResNet + Mask R-CNN model
+# Example 1: Quick test with working combination
+python train.py --backbone simple --head deformable_detr --use_tiny_data --fast_dev_run
+
+# Example 2: Train with COCO dataset (requires network access)
 python train.py --backbone resnet --head maskrcnn
 
-# Example 2: Train a DINO ViT + Mask R-CNN model
-python train.py --backbone dino --head maskrcnn
-
-# Example 3: Train a repvgg + ContourFormer model
-python train.py --backbone repvgg --head contourformer
+# Example 3: Train with tiny dataset for development
+python train.py --backbone simple --head deformable_detr --use_tiny_data --max_steps 100
 ```
 
 -----
@@ -80,12 +84,84 @@ You can customize training with various parameters.
 | `--fast_dev_run` | `flag` | `False` | Run a single batch for testing the code. |
 | `--warmup_steps` | `int` | `500` | Steps to train on labeled data only before adding unsupervised loss. |
 | `--unsup_rampup_steps`| `int` | `5000`| Steps to ramp up the unsupervised loss weight. |
+| `--use_tiny_data` | `flag` | `False` | Use the tiny synthetic dataset for quick training and testing. |
 
 **Example with advanced settings**:
 
 ```bash
-python train.py --backbone sam --head mask2former --image_size 512 --batch_size 4 --learning_rate 1e-4
+python train.py --backbone simple --head deformable_detr --use_tiny_data --fast_dev_run
 ```
+
+### Quick Testing
+
+For rapid development and testing, use the tiny synthetic dataset:
+
+```bash
+# Generate tiny dataset (100 train, 20 val, 20 test images)
+python generate_tiny_data.py
+
+# Quick training test with tiny data
+python train.py --backbone simple --head deformable_detr --use_tiny_data --fast_dev_run
+```
+
+-----
+
+## 🧪 Testing Status
+
+This table shows the current status of all backbone-head combinations:
+
+| Backbone | Head | Status | Notes |
+|----------|------|--------|-------|
+| simple | maskrcnn | 🔄 Work in Progress | Head expects training targets |
+| simple | contourformer | 🔄 Work in Progress | Shape mismatch in feature dimensions |
+| simple | deformable_detr | ✅ Working | Ready for training and evaluation |
+| dino | maskrcnn | 🔄 Work in Progress | Requires external model download |
+| dino | contourformer | 🔄 Work in Progress | Requires external model download |
+| dino | deformable_detr | 🔄 Work in Progress | Requires external model download |
+| sam | maskrcnn | 🔄 Work in Progress | Requires external model download |
+| sam | contourformer | 🔄 Work in Progress | Requires external model download |
+| sam | deformable_detr | 🔄 Work in Progress | Requires external model download |
+| swin | maskrcnn | 🔄 Work in Progress | Requires external model download |
+| swin | contourformer | 🔄 Work in Progress | Requires external model download |
+| swin | deformable_detr | 🔄 Work in Progress | Requires external model download |
+| convnext | maskrcnn | 🔄 Work in Progress | Requires external model download |
+| convnext | contourformer | 🔄 Work in Progress | Requires external model download |
+| convnext | deformable_detr | 🔄 Work in Progress | Requires external model download |
+| repvgg | maskrcnn | 🔄 Work in Progress | Requires external model download |
+| repvgg | contourformer | 🔄 Work in Progress | Requires external model download |
+| repvgg | deformable_detr | 🔄 Work in Progress | Requires external model download |
+| resnet | maskrcnn | 🔄 Work in Progress | Requires external model download |
+| resnet | contourformer | 🔄 Work in Progress | Requires external model download |
+| resnet | deformable_detr | 🔄 Work in Progress | Requires external model download |
+
+### Test Details
+
+- **Status**: Whether the combination can be instantiated and run without errors
+- **Working**: Ready for production training and evaluation
+- **Work in Progress**: Known issues that need to be resolved
+
+### Running Tests
+
+To run the comprehensive test suite:
+
+```bash
+# Generate tiny dataset first
+python generate_tiny_data.py
+
+# Quick model compatibility test (fast)
+python quick_model_test.py
+
+# Full training convergence test (slower)
+python test_model_combinations.py --max_steps 10
+```
+
+Test results are saved to JSON files for detailed analysis:
+- `quick_test_results.json` - Model instantiation and forward pass results
+- `test_results.json` - Full training test results (if run)
+
+### Current Limitations
+
+Most backbone models require downloading pretrained weights from HuggingFace/timm, which may fail in restricted network environments. The `simple` backbone works without external dependencies for testing purposes.
 
 -----
 
@@ -98,6 +174,24 @@ python visualize_model.py path/to/your/checkpoint.ckpt --project_dir ./SSL_Insta
 ```
 
 A file named `model_predictions_viz.png` will be saved in the same directory as your checkpoint.
+
+-----
+
+## 🔧 Project Structure
+
+This project has been refactored into a modular structure for better maintainability:
+
+- **`omniseg/`** - Main package with organized modules
+  - **`config/`** - Configuration settings and model defaults
+  - **`data/`** - Dataset utilities and data loading
+  - **`models/`** - Backbone and head model implementations
+  - **`training/`** - PyTorch Lightning training logic
+- **`docs/`** - Additional documentation including refactoring details
+- **`generate_tiny_data.py`** - Creates synthetic dataset for testing
+- **`quick_model_test.py`** - Fast model compatibility testing
+- **`test_model_combinations.py`** - Comprehensive training convergence testing
+
+For detailed information about the modular structure, see [`docs/REFACTORED_README.md`](docs/REFACTORED_README.md).
 
 -----
 
