@@ -148,15 +148,43 @@ To run the comprehensive test suite:
 # Generate tiny dataset first
 python generate_tiny_data.py
 
-# Quick model compatibility test (fast)
-python quick_model_test.py
+# Quick model compatibility test (fast) - now located in tests/ folder
+./run_tests.sh
+# OR
+python -m tests.quick_model_test
 
 # Full training convergence test (slower)
 python test_model_combinations.py --max_steps 10
 ```
 
+**HuggingFace Authentication Setup:**
+
+Most backbone models require downloading from HuggingFace Hub. To enable this:
+
+1. Get a HuggingFace token from [https://huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
+2. Set it as an environment variable:
+   ```bash
+   export HF_TOKEN=your_token_here
+   # OR
+   export HUGGINGFACE_TOKEN=your_token_here
+   ```
+3. Run tests with authentication:
+   ```bash
+   HF_TOKEN=your_token ./run_tests.sh
+   ```
+
+For GitHub Actions, set the token as a repository secret named `HF_TOKEN`:
+
+1. Go to your repository settings
+2. Navigate to "Secrets and variables" → "Actions" 
+3. Click "New repository secret"
+4. Name: `HF_TOKEN`
+5. Value: `your_huggingface_token_here`
+
+The automated tests will run on every push and pull request.
+
 Test results are saved to JSON files for detailed analysis:
-- `quick_test_results.json` - Model instantiation and forward pass results
+- `tests/quick_test_results.json` - Model instantiation and forward pass results
 - `test_results.json` - Full training test results (if run)
 
 ### Current Limitations
@@ -186,10 +214,13 @@ This project has been refactored into a modular structure for better maintainabi
   - **`data/`** - Dataset utilities and data loading
   - **`models/`** - Backbone and head model implementations
   - **`training/`** - PyTorch Lightning training logic
+- **`tests/`** - Test modules and test results
+  - **`quick_model_test.py`** - Fast model compatibility testing
+  - **`quick_test_results.json`** - Test results (generated after running tests)
 - **`docs/`** - Additional documentation including refactoring details
 - **`generate_tiny_data.py`** - Creates synthetic dataset for testing
-- **`quick_model_test.py`** - Fast model compatibility testing
 - **`test_model_combinations.py`** - Comprehensive training convergence testing
+- **`run_tests.sh`** - Convenient test runner script
 
 For detailed information about the modular structure, see [`docs/REFACTORED_README.md`](docs/REFACTORED_README.md).
 

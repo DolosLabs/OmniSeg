@@ -6,6 +6,7 @@ pycocotools
 tqdm
 pytorch-lightning
 git+https://github.com/huggingface/transformers.git
+huggingface_hub
 accelerate
 timm
 scipy

@@ -1,0 +1,102 @@
+name: Model Compatibility Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:  # Allow manual triggering
+
+jobs:
+  test-models:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+          
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Run model compatibility tests
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      run: |
+        ./run_tests.sh
+        
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      if: always()  # Upload even if tests fail
+      with:
+        name: test-results
+        path: tests/quick_test_results.json
+        
+    - name: Comment test results on PR
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const path = 'tests/quick_test_results.json';
+          
+          if (!fs.existsSync(path)) {
+            console.log('Test results file not found');
+            return;
+          }
+          
+          const results = JSON.parse(fs.readFileSync(path, 'utf8'));
+          const total = Object.keys(results).length;
+          const working = Object.values(results).filter(r => r.status === 'working').length;
+          const failed = total - working;
+          
+          const workingCombos = Object.values(results)
+            .filter(r => r.status === 'working')
+            .map(r => `${r.backbone}+${r.head}`)
+            .join(', ');
+            
+          const failedCombos = Object.values(results)
+            .filter(r => r.status !== 'working')
+            .map(r => `${r.backbone}+${r.head}`)
+            .slice(0, 5)  // Show only first 5 to avoid too long comments
+            .join(', ');
+          
+          const body = `## 🧪 Model Compatibility Test Results
+          
+          **Summary:**
+          - Total combinations tested: ${total}
+          - Working: ${working} (${(working/total*100).toFixed(1)}%)
+          - Failed: ${failed} (${(failed/total*100).toFixed(1)}%)
+          
+          **Working combinations:** ${workingCombos || 'None'}
+          
+          **Failed combinations:** ${failedCombos}${failed > 5 ? ` and ${failed-5} more...` : ''}
+          
+          <details>
+          <summary>View detailed results</summary>
+          
+          \`\`\`json
+          ${JSON.stringify(results, null, 2).substring(0, 2000)}${JSON.stringify(results, null, 2).length > 2000 ? '...\n}' : ''}
+          \`\`\`
+          
+          </details>`;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: body
+          });

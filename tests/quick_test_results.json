@@ -2,18 +2,18 @@
   "simple_maskrcnn": {
     "backbone": "simple",
     "head": "maskrcnn",
-    "status": "failed",
-    "instantiation": false,
-    "forward_pass": false,
-    "error": "Head failed: targets should not be none when in training mode"
+    "status": "working",
+    "instantiation": true,
+    "forward_pass": true,
+    "error": null
   },
   "simple_contourformer": {
     "backbone": "simple",
     "head": "contourformer",
-    "status": "failed",
-    "instantiation": false,
-    "forward_pass": false,
-    "error": "Head failed: mat1 and mat2 shapes cannot be multiplied (4096x16 and 256x512)"
+    "status": "working",
+    "instantiation": true,
+    "forward_pass": true,
+    "error": null
   },
   "simple_deformable_detr": {
     "backbone": "simple",
