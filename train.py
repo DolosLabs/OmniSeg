@@ -641,41 +641,131 @@ class SSLContourFormer(nn.Module):
 # --- Step 3: Data Handling ---
 # --- START: ContourFormer Utilities ---
 def masks_to_contours(masks, num_points=50):
-    """Convert binary masks to fixed-size contour point sets."""
+    """Convert binary masks to fixed-size contour point sets.
+    
+    Extracts the most significant contour from each mask and ensures
+    proper polygon closing and point sampling for accurate reconstruction.
+    """
     contours_list, valid_indices = [], []
     for i, mask in enumerate(masks):
+        # Skip empty masks
+        if mask.sum() == 0:
+            continue
+            
         mask_np = mask.cpu().numpy().astype(np.uint8)
         contours = find_contours(mask_np, 0.5)
-        if not contours: continue
-        contour = sorted(contours, key=lambda x: len(x))[-1]
-        contour = np.flip(contour, axis=1).copy()
+        if not contours:
+            continue
+        
+        # Use the largest contour (most significant boundary)
+        contour = sorted(contours, key=lambda x: len(x), reverse=True)[0]
+        
+        # Skip contours that are too small to be meaningful
+        if len(contour) < 4:
+            continue
+            
+        # Flip coordinates to (x, y) format and ensure proper data type
+        contour = np.flip(contour, axis=1).astype(np.float64)
+        
+        # Explicitly close the polygon if not already closed
+        if not np.allclose(contour[0], contour[-1], atol=1e-6):
+            contour = np.vstack([contour, contour[0:1]])
+        
         contour = torch.tensor(contour, dtype=torch.float32)
-        contour[:, 0] /= mask.shape[1]
-        contour[:, 1] /= mask.shape[0]
+        
+        # Normalize coordinates to [0, 1] range with bounds checking
+        contour[:, 0] = torch.clamp(contour[:, 0] / max(mask.shape[1], 1), 0.0, 1.0)
+        contour[:, 1] = torch.clamp(contour[:, 1] / max(mask.shape[0], 1), 0.0, 1.0)
+        
+        # Compute path distances for uniform sampling
         path = contour.t()
-        distance = torch.cumsum(torch.sqrt(torch.sum((path[:, 1:] - path[:, :-1])**2, dim=0)), dim=0)
+        diffs = path[:, 1:] - path[:, :-1]
+        distances = torch.sqrt(torch.sum(diffs**2, dim=0))
+        distance = torch.cumsum(distances, dim=0)
         distance = torch.cat([torch.tensor([0.0]), distance])
-        if distance[-1] < 1e-6: continue
+        
+        # Skip degenerate contours (too short perimeter)
+        if distance[-1] < 1e-6:
+            continue
+            
+        # Sample points uniformly along the contour
         f = interp1d(distance.numpy(), path.numpy(), kind='linear', axis=1, fill_value="extrapolate")
         new_distances = np.linspace(0, distance[-1].item(), num_points)
         sampled_points = torch.from_numpy(f(new_distances).T).to(torch.float32)
+        
+        # Ensure sampled points are properly bounded and handle any numerical issues
+        sampled_points = torch.clamp(sampled_points, 0.0, 1.0)
+        
+        # Verify we have valid points
+        if torch.isnan(sampled_points).any() or torch.isinf(sampled_points).any():
+            continue
+            
         contours_list.append(sampled_points)
         valid_indices.append(i)
-    if not contours_list: return None, None
+        
+    if not contours_list:
+        return None, None
     return torch.stack(contours_list), valid_indices
 
 def contours_to_masks(contours, img_shape):
-    """Convert sets of contour points to binary masks."""
+    """Convert sets of contour points to binary masks.
+    
+    Handles coordinate rounding, out-of-bounds points, and empty contours
+    to ensure robust mask reconstruction.
+    """
     h, w = img_shape
     masks = []
+    
     for contour_set in contours:
+        # Skip empty contours
+        if contour_set.numel() == 0:
+            masks.append(torch.zeros(h, w, dtype=torch.bool))
+            continue
+            
         points = contour_set.clone()
-        points[:, 0] *= w
-        points[:, 1] *= h
-        points = points.cpu().numpy().flatten().tolist()
-        img = Image.new('L', (w, h), 0)
-        ImageDraw.Draw(img).polygon(points, outline=1, fill=1)
-        masks.append(torch.from_numpy(np.array(img)).bool())
+        
+        # Denormalize coordinates with careful bounds checking
+        points[:, 0] = torch.clamp(points[:, 0] * w, 0, w - 0.01)  # Slight margin to avoid edge issues
+        points[:, 1] = torch.clamp(points[:, 1] * h, 0, h - 0.01)
+        
+        # Convert to numpy and handle coordinate rounding more carefully
+        points_np = points.cpu().numpy()
+        
+        # For small polygons, use more precise rounding
+        if len(points_np) <= 10:
+            points_rounded = points_np  # Keep floating point for small polygons
+        else:
+            points_rounded = np.round(points_np).astype(np.float64)
+        
+        # Remove consecutive duplicate points to avoid PIL polygon issues
+        unique_points = [points_rounded[0]]
+        for point in points_rounded[1:]:
+            if not np.allclose(point, unique_points[-1], atol=0.5):
+                unique_points.append(point)
+        
+        # Ensure polygon is closed
+        if len(unique_points) >= 3 and not np.allclose(unique_points[0], unique_points[-1], atol=0.5):
+            unique_points.append(unique_points[0])
+        
+        if len(unique_points) < 3:
+            # Not enough points for a valid polygon, create a minimal mask
+            masks.append(torch.zeros(h, w, dtype=torch.bool))
+            continue
+            
+        # Flatten points for PIL polygon drawing
+        points_flat = np.array(unique_points).flatten().tolist()
+        
+        try:
+            # Create mask using PIL polygon drawing
+            img = Image.new('L', (w, h), 0)
+            ImageDraw.Draw(img).polygon(points_flat, outline=1, fill=1)
+            mask = torch.from_numpy(np.array(img)).bool()
+            masks.append(mask)
+        except Exception as e:
+            # Handle any drawing errors gracefully
+            print(f"Warning: Error drawing polygon: {e}")
+            masks.append(torch.zeros(h, w, dtype=torch.bool))
+    
     return torch.stack(masks) if masks else torch.empty(0, h, w, dtype=torch.bool)
 # --- END: ContourFormer Utilities ---
 
