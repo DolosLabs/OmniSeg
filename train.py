@@ -1,6 +1,17 @@
 # train.py
 # Semi-Supervised Instance Segmentation with Multiple Backbones and Heads (PyTorch Lightning Version)
 #
+# This script provides a unified, modular framework for training instance segmentation models
+# with various backbone architectures and segmentation heads. The code has been refactored
+# for better maintainability, extensibility, and consistency.
+#
+# Features:
+# - Multiple backbone support: DINO, SAM, Swin, ConvNeXt, RepVGG, ResNet
+# - Multiple head support: Mask R-CNN, Deformable DETR, ContourFormer
+# - Modular architecture with base classes and factory patterns
+# - Type hints and comprehensive error handling
+# - Semi-supervised learning with teacher-student framework
+#
 # To run this script, first install the required dependencies:
 # pip install transformers torch torchvision tqdm pycocotools pytorch-lightning timm scikit-image scipy
 #
@@ -19,8 +30,10 @@ import zipfile
 import urllib.request
 import argparse
 import random
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from types import SimpleNamespace
+from typing import Dict, List, Tuple, Optional, Any, Union
+from abc import ABC, abstractmethod
 
 import numpy as np
 import torch
@@ -38,14 +51,10 @@ import pytorch_lightning as pl
 from pytorch_lightning.utilities.combined_loader import CombinedLoader
 from pytorch_lightning.callbacks import ModelCheckpoint
 from transformers import AutoModel, AutoConfig
-from types import SimpleNamespace
-
-
 from torchvision.models.detection import MaskRCNN
 from torchvision.models.detection.rpn import AnchorGenerator
 from torchvision.ops import FeaturePyramidNetwork, box_convert, generalized_box_iou
 import timm
-from collections import OrderedDict
 from scipy.optimize import linear_sum_assignment
 from skimage.measure import find_contours
 from scipy.interpolate import interp1d
@@ -55,8 +64,59 @@ PROJECT_DIR = './SSL_Instance_Segmentation'
 EPOCHS = 300
 NUM_CLASSES = 10
 
+# Backbone and Head Configuration
+BACKBONE_CONFIGS = {
+    'dino': {'default_size': 224, 'model_name': 'facebook/dinov3-vitl16-pretrain-lvd1689m'},
+    'sam': {'default_size': 1024, 'model_name': 'facebook/sam-vit-huge'},
+    'swin': {'default_size': 224, 'model_name': 'microsoft/swin-base-patch4-window7-224-in22k'},
+    'convnext': {'default_size': 224, 'model_name': 'convnext_base.fb_in22k'},
+    'repvgg': {'default_size': 224, 'model_name': 'repvgg_b0.rvgg_in1k'},
+    'resnet': {'default_size': 224, 'model_name': 'resnet50.a1_in1k'}
+}
 
-# --- Step 1: COCO Dataset Utility ---
+HEAD_CONFIGS = {
+    'maskrcnn': {'precision': '16-mixed', 'batch_size': 8},
+    'contourformer': {'precision': '32', 'batch_size': 4},
+    'deformable_detr': {'precision': '32', 'batch_size': 4}
+}
+
+
+# --- Base Classes ---
+class BaseBackbone(ABC):
+    """Abstract base class for all backbone architectures."""
+    
+    def __init__(self, freeze_encoder: bool = True):
+        super().__init__()
+        self.freeze_encoder = freeze_encoder
+    
+    @abstractmethod
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Forward pass returning feature maps with consistent naming."""
+        pass
+    
+    @property
+    @abstractmethod
+    def output_channels(self) -> Dict[str, int]:
+        """Return the number of output channels for each feature level."""
+        pass
+
+
+class BaseHead(ABC):
+    """Abstract base class for all segmentation heads."""
+    
+    def __init__(self, num_classes: int, backbone_type: str = 'dino', image_size: int = 224):
+        super().__init__()
+        self.num_classes = num_classes
+        self.backbone_type = backbone_type
+        self.image_size = image_size
+    
+    @abstractmethod
+    def forward(self, pixel_values: torch.Tensor, targets: Optional[List[Dict]] = None) -> Dict[str, torch.Tensor]:
+        """Forward pass for training/inference."""
+        pass
+
+
+# --- COCO Dataset Utilities ---
 def download_coco2017(root_dir=".", splits=['train', 'val', 'test']):
     base_dir = os.path.join(root_dir, 'coco2017')
     annotations_dir = os.path.join(base_dir, 'annotations')
@@ -87,162 +147,331 @@ def download_coco2017(root_dir=".", splits=['train', 'val', 'test']):
     return base_dir
 
 
-# --- Step 2: Model Architecture Definition ---
-class DinoVisionTransformerBackbone(nn.Module):
-    def __init__(self, model_name='facebook/dinov3-vitl16-pretrain-lvd1689m', feature_layer=8):
-        super().__init__()
+# --- Backbone Architectures ---
+class DinoVisionTransformerBackbone(BaseBackbone, nn.Module):
+    def __init__(self, model_name: str = None, feature_layer: int = 8, freeze_encoder: bool = True):
+        BaseBackbone.__init__(self, freeze_encoder)
+        nn.Module.__init__(self)
+        
+        if model_name is None:
+            model_name = BACKBONE_CONFIGS['dino']['model_name']
+            
         print(f"Loading backbone: {model_name}")
         self.dino = AutoModel.from_pretrained(model_name, torch_dtype=torch.float32)
-        for p in self.dino.parameters(): p.requires_grad = False
-        self.dino.eval(); self.feature_layer_index = feature_layer; self.num_register_tokens = self.dino.config.num_register_tokens
-        embed_dim = self.dino.config.hidden_size; decoder_channels = [128, 256, 512, 1024]
-        self.pyramid_layers = nn.ModuleList(); self.pyramid_layers.append(nn.Conv2d(embed_dim, decoder_channels[0], kernel_size=1))
+        
+        if self.freeze_encoder:
+            for p in self.dino.parameters(): 
+                p.requires_grad = False
+            self.dino.eval()
+            
+        self.feature_layer_index = feature_layer
+        self.num_register_tokens = self.dino.config.num_register_tokens
+        embed_dim = self.dino.config.hidden_size
+        decoder_channels = [128, 256, 512, 1024]
+        
+        self.pyramid_layers = nn.ModuleList()
+        self.pyramid_layers.append(nn.Conv2d(embed_dim, decoder_channels[0], kernel_size=1))
         for i in range(1, len(decoder_channels)):
-            self.pyramid_layers.append(nn.Sequential(nn.Conv2d(decoder_channels[i-1], decoder_channels[i], kernel_size=3, stride=2, padding=1), nn.ReLU()))
-    def forward(self, x):
-        outputs = self.dino(pixel_values=x, output_hidden_states=True); hidden_state = outputs.hidden_states[self.feature_layer_index]
-        B, N, D = hidden_state.shape; tokens_to_skip = 1 + self.num_register_tokens; patch_tokens = hidden_state[:, tokens_to_skip:, :]
-        seq_len_patches = N - tokens_to_skip; side_len = int(math.sqrt(seq_len_patches))
-        if side_len * side_len != seq_len_patches: raise ValueError("Patch tokens do not form a perfect square.")
-        fmap = patch_tokens.permute(0, 2, 1).reshape(B, D, side_len, side_len); features = {}; current_fmap = fmap
+            self.pyramid_layers.append(nn.Sequential(
+                nn.Conv2d(decoder_channels[i-1], decoder_channels[i], kernel_size=3, stride=2, padding=1), 
+                nn.ReLU()
+            ))
+        self._decoder_channels = decoder_channels
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        outputs = self.dino(pixel_values=x, output_hidden_states=True)
+        hidden_state = outputs.hidden_states[self.feature_layer_index]
+        B, N, D = hidden_state.shape
+        tokens_to_skip = 1 + self.num_register_tokens
+        patch_tokens = hidden_state[:, tokens_to_skip:, :]
+        seq_len_patches = N - tokens_to_skip
+        side_len = int(math.sqrt(seq_len_patches))
+        
+        if side_len * side_len != seq_len_patches:
+            raise ValueError("Patch tokens do not form a perfect square.")
+            
+        fmap = patch_tokens.permute(0, 2, 1).reshape(B, D, side_len, side_len)
+        features = {}
+        current_fmap = fmap
+        
         for i, layer in enumerate(self.pyramid_layers):
-            current_fmap = layer(current_fmap); features[f"res{i+2}"] = current_fmap
+            current_fmap = layer(current_fmap)
+            features[f"res{i+2}"] = current_fmap
         return features
 
-class SamVisionTransformerBackbone(nn.Module):
-    def __init__(self, model_name='facebook/sam-vit-huge', freeze_encoder=True):
-        super().__init__()
+    @property
+    def output_channels(self) -> Dict[str, int]:
+        return {f"res{i+2}": ch for i, ch in enumerate(self._decoder_channels)}
+
+class SamVisionTransformerBackbone(BaseBackbone, nn.Module):
+    def __init__(self, model_name: str = None, freeze_encoder: bool = True):
+        BaseBackbone.__init__(self, freeze_encoder)
+        nn.Module.__init__(self)
+        
+        if model_name is None:
+            model_name = BACKBONE_CONFIGS['sam']['model_name']
+            
         print(f"Loading backbone: {model_name}")
         self.sam = AutoModel.from_pretrained(model_name, torch_dtype=torch.float32)
-        if freeze_encoder:
-            for p in self.sam.parameters(): p.requires_grad = False
+        
+        if self.freeze_encoder:
+            for p in self.sam.parameters():
+                p.requires_grad = False
             self.sam.eval()
+            
         embed_dim = self.sam.config.vision_config.hidden_size
         decoder_channels = [128, 256, 512, 1024]
-        self.proj = nn.Conv2d(embed_dim, decoder_channels[0], kernel_size=1); self.pyramid_layers = nn.ModuleList()
+        self.proj = nn.Conv2d(embed_dim, decoder_channels[0], kernel_size=1)
+        self.pyramid_layers = nn.ModuleList()
+        
         for i in range(1, len(decoder_channels)):
-            self.pyramid_layers.append(nn.Sequential(nn.Conv2d(decoder_channels[i-1], decoder_channels[i], kernel_size=3, stride=2, padding=1), nn.ReLU()))
-    def forward(self, x):
-        outputs = self.sam.vision_encoder(pixel_values=x); last_hidden_state = outputs.last_hidden_state
-        B, N, D = last_hidden_state.shape; side_len = int(math.sqrt(N))
-        if side_len * side_len != N: raise ValueError("Patch tokens do not form a perfect square.")
+            self.pyramid_layers.append(nn.Sequential(
+                nn.Conv2d(decoder_channels[i-1], decoder_channels[i], kernel_size=3, stride=2, padding=1), 
+                nn.ReLU()
+            ))
+        self._decoder_channels = decoder_channels
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        outputs = self.sam.vision_encoder(pixel_values=x)
+        last_hidden_state = outputs.last_hidden_state
+        B, N, D = last_hidden_state.shape
+        side_len = int(math.sqrt(N))
+        
+        if side_len * side_len != N:
+            raise ValueError("Patch tokens do not form a perfect square.")
+            
         fmap = last_hidden_state.permute(0, 2, 1).reshape(B, D, side_len, side_len)
-        features = {}; current_fmap = self.proj(fmap); features["res2"] = current_fmap
+        features = {}
+        current_fmap = self.proj(fmap)
+        features["res2"] = current_fmap
+        
         for i, layer in enumerate(self.pyramid_layers):
-            current_fmap = layer(current_fmap); features[f"res{i+3}"] = current_fmap
+            current_fmap = layer(current_fmap)
+            features[f"res{i+3}"] = current_fmap
         return features
 
-class SwinTransformerBackbone(nn.Module):
-    def __init__(self, model_name='microsoft/swin-base-patch4-window7-224-in22k', freeze_encoder=True):
-        super().__init__()
+    @property
+    def output_channels(self) -> Dict[str, int]:
+        return {f"res{i+2}": ch for i, ch in enumerate(self._decoder_channels)}
+
+class SwinTransformerBackbone(BaseBackbone, nn.Module):
+    def __init__(self, model_name: str = None, freeze_encoder: bool = True):
+        BaseBackbone.__init__(self, freeze_encoder)
+        nn.Module.__init__(self)
+        
+        if model_name is None:
+            model_name = BACKBONE_CONFIGS['swin']['model_name']
+            
         print(f"Loading backbone: {model_name}")
         self.swin = AutoModel.from_pretrained(model_name, torch_dtype=torch.float32, out_indices=(0, 1, 2, 3))
-        if freeze_encoder:
-            for p in self.swin.parameters(): p.requires_grad = False
+        
+        if self.freeze_encoder:
+            for p in self.swin.parameters():
+                p.requires_grad = False
             self.swin.eval()
-    def forward(self, x):
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         outputs = self.swin(pixel_values=x)
         return {f"res{i+2}": hs for i, hs in enumerate(outputs.hidden_states)}
 
-class ConvNeXtBackbone(nn.Module):
-    def __init__(self, model_name='convnext_base.fb_in22k', freeze_encoder=True):
-        super().__init__()
+    @property
+    def output_channels(self) -> Dict[str, int]:
+        # Swin output channels depend on the specific model, using reasonable defaults
+        return {"res2": 128, "res3": 256, "res4": 512, "res5": 1024}
+
+
+class ConvNeXtBackbone(BaseBackbone, nn.Module):
+    def __init__(self, model_name: str = None, freeze_encoder: bool = True):
+        BaseBackbone.__init__(self, freeze_encoder)
+        nn.Module.__init__(self)
+        
+        if model_name is None:
+            model_name = BACKBONE_CONFIGS['convnext']['model_name']
+            
         print(f"Loading backbone: {model_name}")
         self.convnext = timm.create_model(model_name, pretrained=True, features_only=True, out_indices=(0, 1, 2, 3))
-        if freeze_encoder:
-            for p in self.convnext.parameters(): p.requires_grad = False
+        
+        if self.freeze_encoder:
+            for p in self.convnext.parameters():
+                p.requires_grad = False
             self.convnext.eval()
-    def forward(self, x):
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         outputs = self.convnext(x)
         return {f"res{i+2}": out for i, out in enumerate(outputs)}
 
-class RepVGGBackbone(nn.Module):
-    def __init__(self, model_name='repvgg_b0.rvgg_in1k', freeze_encoder=True):
-        super().__init__()
+    @property
+    def output_channels(self) -> Dict[str, int]:
+        # ConvNeXt output channels depend on the specific model
+        return {"res2": 128, "res3": 256, "res4": 512, "res5": 1024}
+
+
+class RepVGGBackbone(BaseBackbone, nn.Module):
+    def __init__(self, model_name: str = None, freeze_encoder: bool = True):
+        BaseBackbone.__init__(self, freeze_encoder)
+        nn.Module.__init__(self)
+        
+        if model_name is None:
+            model_name = BACKBONE_CONFIGS['repvgg']['model_name']
+            
         print(f"Loading backbone: {model_name}")
         self.repvgg = timm.create_model(model_name, pretrained=True, features_only=True, out_indices=(0, 1, 2, 3))
-        if freeze_encoder:
-            for p in self.repvgg.parameters(): p.requires_grad = False
+        
+        if self.freeze_encoder:
+            for p in self.repvgg.parameters():
+                p.requires_grad = False
             self.repvgg.eval()
-    def forward(self, x):
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         outputs = self.repvgg(x)
         return {f"res{i+2}": out for i, out in enumerate(outputs)}
 
-class ResNetBackbone(nn.Module):
-    def __init__(self, model_name='resnet50.a1_in1k', freeze_encoder=True):
-        super().__init__()
+    @property
+    def output_channels(self) -> Dict[str, int]:
+        # RepVGG output channels
+        return {"res2": 64, "res3": 128, "res4": 256, "res5": 512}
+
+
+class ResNetBackbone(BaseBackbone, nn.Module):
+    def __init__(self, model_name: str = None, freeze_encoder: bool = True):
+        BaseBackbone.__init__(self, freeze_encoder)
+        nn.Module.__init__(self)
+        
+        if model_name is None:
+            model_name = BACKBONE_CONFIGS['resnet']['model_name']
+            
         print(f"Loading backbone: {model_name}")
         self.resnet = timm.create_model(model_name, pretrained=True, features_only=True, out_indices=(0, 1, 2, 3))
-        if freeze_encoder:
-            for p in self.resnet.parameters(): p.requires_grad = False
+        
+        if self.freeze_encoder:
+            for p in self.resnet.parameters():
+                p.requires_grad = False
             self.resnet.eval()
-    def forward(self, x):
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         outputs = self.resnet(x)
         return {f"res{i+2}": out for i, out in enumerate(outputs)}
 
-# --- Head Architectures ---
-def get_backbone(backbone_type):
+    @property
+    def output_channels(self) -> Dict[str, int]:
+        # ResNet50 output channels
+        return {"res2": 256, "res3": 512, "res4": 1024, "res5": 2048}
+
+
+# --- Backbone Factory ---
+def get_backbone(backbone_type: str, **kwargs) -> BaseBackbone:
     """Factory function to create a backbone instance."""
-    if backbone_type == 'dino':
-        return DinoVisionTransformerBackbone()
-    elif backbone_type == 'sam':
-        return SamVisionTransformerBackbone()
-    elif backbone_type == 'swin':
-        return SwinTransformerBackbone()
-    elif backbone_type == 'convnext':
-        return ConvNeXtBackbone()
-    elif backbone_type == 'repvgg':
-        return RepVGGBackbone()
-    elif backbone_type == 'resnet':
-        return ResNetBackbone()
-    else:
-        raise ValueError(f"Unsupported backbone_type: {backbone_type}")
+    backbone_classes = {
+        'dino': DinoVisionTransformerBackbone,
+        'sam': SamVisionTransformerBackbone,
+        'swin': SwinTransformerBackbone,
+        'convnext': ConvNeXtBackbone,
+        'repvgg': RepVGGBackbone,
+        'resnet': ResNetBackbone
+    }
+    
+    if backbone_type not in backbone_classes:
+        raise ValueError(f"Unsupported backbone_type: {backbone_type}. "
+                        f"Available options: {list(backbone_classes.keys())}")
+    
+    return backbone_classes[backbone_type](**kwargs)
+
+
+def get_available_backbones() -> List[str]:
+    """Get list of all available backbone types."""
+    return list(BACKBONE_CONFIGS.keys())
+
+
+def get_available_heads() -> List[str]:
+    """Get list of all available head types.""" 
+    return list(HEAD_CONFIGS.keys())
+
+
+def get_default_config(backbone_type: str, head_type: str) -> Dict[str, Any]:
+    """Get default configuration for a backbone-head combination."""
+    if backbone_type not in BACKBONE_CONFIGS:
+        raise ValueError(f"Unknown backbone: {backbone_type}")
+    if head_type not in HEAD_CONFIGS:
+        raise ValueError(f"Unknown head: {head_type}")
+    
+    return {
+        'backbone': BACKBONE_CONFIGS[backbone_type],
+        'head': HEAD_CONFIGS[head_type],
+        'image_size': BACKBONE_CONFIGS[backbone_type]['default_size'],
+        'batch_size': HEAD_CONFIGS[head_type]['batch_size'],
+        'precision': HEAD_CONFIGS[head_type]['precision']
+    }
+
+# --- Head Architectures ---
 
 class GenericBackboneWithFPN(nn.Module):
-    def __init__(self, backbone_type='dino', fpn_out_channels=256, dummy_input_size=224):
+    """Generic wrapper to add FPN to any backbone."""
+    
+    def __init__(self, backbone_type: str = 'dino', fpn_out_channels: int = 256, dummy_input_size: int = 224):
         super().__init__()
         self.backbone = get_backbone(backbone_type)
+        
+        # Discover output channels by running a dummy forward pass
         dummy = torch.randn(1, 3, dummy_input_size, dummy_input_size)
         with torch.no_grad():
             feat_dict = self.backbone(dummy)
+        
         feat_keys = sorted(list(feat_dict.keys()))
         in_channels_list = [feat_dict[k].shape[1] for k in feat_keys]
         self.out_channels = fpn_out_channels
         self.fpn = FeaturePyramidNetwork(in_channels_list=in_channels_list, out_channels=self.out_channels)
         self._orig_keys = feat_keys
         self._num_levels = len(feat_keys)
-    def forward(self, x):
+
+    def forward(self, x: torch.Tensor) -> OrderedDict[str, torch.Tensor]:
         feats = self.backbone(x)
         ordered_input = OrderedDict()
+        
         for k in self._orig_keys:
             if k not in feats:
                 raise KeyError(f"Expected feature '{k}' from backbone but got keys: {list(feats.keys())}")
             ordered_input[k] = feats[k]
+        
         fpn_out = self.fpn(ordered_input)
         # Remap keys to strings '0', '1', '2', ... for DETR compatibility
         remapped = OrderedDict([(str(i), val) for i, (key, val) in enumerate(fpn_out.items())])
         return remapped
 
-class GenericMaskRCNN(nn.Module):
-    def __init__(self, num_classes, backbone_type='dino', image_size=224, anchor_base_size=32):
-        super().__init__()
+
+class MaskRCNNHead(BaseHead, nn.Module):
+    """Mask R-CNN segmentation head."""
+    
+    def __init__(self, num_classes: int, backbone_type: str = 'dino', image_size: int = 224, anchor_base_size: int = 32):
+        BaseHead.__init__(self, num_classes, backbone_type, image_size)
+        nn.Module.__init__(self)
+        
         backbone_with_fpn = GenericBackboneWithFPN(backbone_type, dummy_input_size=image_size)
         backbone_with_fpn.out_channels = backbone_with_fpn.out_channels
+        
+        # Discover number of feature maps
         dummy = torch.randn(1, 3, image_size, image_size)
         with torch.no_grad():
             feats = backbone_with_fpn(dummy)
+        
         num_maps = len(feats)
         if num_maps == 0:
             raise RuntimeError("Backbone+FPN returned no feature maps; expected >=1")
+        
         sizes = tuple([(anchor_base_size * (2 ** i),) for i in range(num_maps)])
         aspect_ratios = ((0.5, 1.0, 2.0),) * num_maps
         anchor_generator = AnchorGenerator(sizes=sizes, aspect_ratios=aspect_ratios)
-        self.model = MaskRCNN(backbone=backbone_with_fpn, num_classes=num_classes + 1, rpn_anchor_generator=anchor_generator)
-    def forward(self, images, targets=None):
-        return self.model(images, targets)
+        
+        self.model = MaskRCNN(
+            backbone=backbone_with_fpn, 
+            num_classes=num_classes + 1, 
+            rpn_anchor_generator=anchor_generator
+        )
+
+    def forward(self, pixel_values: torch.Tensor, targets: Optional[List[Dict]] = None) -> Dict[str, torch.Tensor]:
+        return self.model(pixel_values, targets)
 
 
-# --- START: Deformable DETR Head ---
+# --- Deformable DETR Head ---
 class HungarianMatcherDETR(nn.Module):
     def __init__(self, cost_class: float = 1, cost_bbox: float = 1, cost_giou: float = 1):
         super().__init__()
@@ -336,43 +565,45 @@ class SetCriterionDETR(nn.Module):
                     losses.update(l_dict)
         return {k: v * self.weight_dict[k] for k, v in losses.items() if k in self.weight_dict}
 
-class SSLDeformableDETR(nn.Module):
-    def __init__(self, num_classes, backbone_type='dino', image_size=224):
-        super().__init__()
-        self.num_classes = num_classes
-        self.backbone = GenericBackboneWithFPN(backbone_type, fpn_out_channels=256, dummy_input_size=image_size)
+class DeformableDETRHead(BaseHead, nn.Module):
+    """Deformable DETR segmentation head."""
+    
+    def __init__(self, num_classes: int, backbone_type: str = 'dino', image_size: int = 224,
+                 d_model: int = 256, num_queries: int = 100, num_decoder_layers: int = 6):
+        BaseHead.__init__(self, num_classes, backbone_type, image_size)
+        nn.Module.__init__(self)
         
-        # DETR configuration
-        self.d_model = 256
-        self.num_queries = 100
+        self.d_model = d_model
+        self.num_queries = num_queries
+        self.backbone = GenericBackboneWithFPN(backbone_type, fpn_out_channels=d_model, dummy_input_size=image_size)
         
         # Query embeddings 
-        self.query_embed = nn.Embedding(self.num_queries, self.d_model)
+        self.query_embed = nn.Embedding(num_queries, d_model)
         
-        # Simple transformer decoder (simplified version of DETR)
+        # Simple transformer decoder
         decoder_layer = nn.TransformerDecoderLayer(
-            d_model=self.d_model,
+            d_model=d_model,
             nhead=8,
             dim_feedforward=2048,
             dropout=0.1,
             batch_first=True
         )
-        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=6)
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
         
         # Prediction heads
-        self.class_embed = nn.Linear(self.d_model, num_classes + 1)
+        self.class_embed = nn.Linear(d_model, num_classes + 1)
         self.bbox_embed = nn.Sequential(
-            nn.Linear(self.d_model, self.d_model),
+            nn.Linear(d_model, d_model),
             nn.ReLU(),
-            nn.Linear(self.d_model, 4)
+            nn.Linear(d_model, 4)
         )
         self.mask_head = nn.Sequential(
-            nn.Linear(self.d_model, self.d_model), 
+            nn.Linear(d_model, d_model), 
             nn.ReLU(),
-            nn.Linear(self.d_model, 256)
+            nn.Linear(d_model, d_model)
         )
         
-        # Loss computation
+        # Loss computation setup
         config = SimpleNamespace(
             class_cost=1.0,
             bbox_cost=5.0,
@@ -401,29 +632,28 @@ class SSLDeformableDETR(nn.Module):
             eos_coef=config.eos_coefficient
         )
 
-    def forward(self, pixel_values, pixel_mask=None, targets=None):
+    def forward(self, pixel_values: torch.Tensor, targets: Optional[List[Dict]] = None) -> Dict[str, torch.Tensor]:
         # 1. Extract backbone features
         feature_maps = self.backbone(pixel_values)
         
         # 2. Use the finest feature map as memory for the transformer
-        finest_features = feature_maps['0']  # Shape: [B, 256, H, W]
+        finest_features = feature_maps['0']  # Shape: [B, d_model, H, W]
         B, C, H, W = finest_features.shape
         
         # Flatten spatial dimensions for transformer
-        memory = finest_features.flatten(2).transpose(1, 2)  # [B, H*W, 256]
+        memory = finest_features.flatten(2).transpose(1, 2)  # [B, H*W, d_model]
         
         # 3. Get query embeddings
-        query_embeds = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)  # [B, num_queries, 256]
+        query_embeds = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)  # [B, num_queries, d_model]
         
         # 4. Apply transformer decoder
-        # Create memory key padding mask (all False since we don't mask any memory positions)
         memory_key_padding_mask = torch.zeros(B, H*W, dtype=torch.bool, device=pixel_values.device)
         
         decoder_output = self.transformer_decoder(
             tgt=query_embeds,
             memory=memory,
             memory_key_padding_mask=memory_key_padding_mask
-        )  # [B, num_queries, 256]
+        )  # [B, num_queries, d_model]
         
         # 5. Apply prediction heads
         logits = self.class_embed(decoder_output)
@@ -658,29 +888,56 @@ class SetCriterionContourFormer(nn.Module):
 
 
 # ------------------------
-# SSLContourFormer using the SimpleDeformableTransformer
+# ContourFormer using the SimpleDeformableTransformer
 # ------------------------
-class SSLContourFormer(nn.Module):
-    def __init__(self, num_classes, backbone_type='dino', image_size=224,
-                 num_queries=100, num_points=50, hidden_dim=256, nheads=8,
-                 num_decoder_layers=6, n_points=4):
-        super().__init__()
+class ContourFormerHead(BaseHead, nn.Module):
+    """ContourFormer segmentation head."""
+    
+    def __init__(self, num_classes: int, backbone_type: str = 'dino', image_size: int = 224,
+                 num_queries: int = 100, num_points: int = 50, hidden_dim: int = 256, 
+                 nheads: int = 8, num_decoder_layers: int = 6, n_points: int = 4):
+        BaseHead.__init__(self, num_classes, backbone_type, image_size)
+        nn.Module.__init__(self)
+        
         self.num_queries = num_queries
         self.num_points = num_points
         self.hidden_dim = hidden_dim
+        
         self.backbone = GenericBackboneWithFPN(backbone_type, fpn_out_channels=hidden_dim, dummy_input_size=image_size)
         self.input_proj = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         self.ref_point_embed = nn.Embedding(num_queries, 2)
-        self.transformer = SimpleDeformableTransformer(d_model=hidden_dim, nheads=nheads,
-                                                       num_decoder_layers=num_decoder_layers, n_points=n_points)
+        
+        self.transformer = SimpleDeformableTransformer(
+            d_model=hidden_dim, 
+            nheads=nheads,
+            num_decoder_layers=num_decoder_layers, 
+            n_points=n_points
+        )
+        
         self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.coord_embed = nn.Linear(hidden_dim, num_points * 2)
-        matcher = HungarianMatcher(cost_class=1, cost_point=5, cost_giou=2, cost_point_init=10, cost_decay=0.95, warmup_epochs=10)
+        
+        # Loss computation setup
+        matcher = HungarianMatcher(
+            cost_class=1, 
+            cost_point=5, 
+            cost_giou=2, 
+            cost_point_init=10, 
+            cost_decay=0.95, 
+            warmup_epochs=10
+        )
         weight_dict = {'loss_ce': 1.0, 'loss_point': 1.0}
-        self.criterion = SetCriterionContourFormer(num_classes, matcher=matcher, weight_dict=weight_dict, eos_coef=0.1, num_points=num_points)
+        self.criterion = SetCriterionContourFormer(
+            num_classes, 
+            matcher=matcher, 
+            weight_dict=weight_dict, 
+            eos_coef=0.1, 
+            num_points=num_points
+        )
 
-    def build_position_encoding(self, feature):
+    def build_position_encoding(self, feature: torch.Tensor) -> torch.Tensor:
+        """Build 2D positional encoding for the feature map."""
         B, C, H, W = feature.shape
         mask = torch.ones(B, H, W, device=feature.device)
         y_embed = mask.cumsum(1, dtype=torch.float32)
@@ -688,6 +945,7 @@ class SSLContourFormer(nn.Module):
         eps = 1e-6
         y_embed = y_embed / (y_embed[:, -1:, :] + eps) * 2 * math.pi
         x_embed = x_embed / (x_embed[:, :, -1:] + eps) * 2 * math.pi
+        
         dim_t = torch.arange(C // 2, device=feature.device)
         dim_t = 10000 ** (2 * (dim_t // 2) / (C // 2))
         pos_x = x_embed[:, :, :, None] / dim_t
@@ -697,21 +955,37 @@ class SSLContourFormer(nn.Module):
         pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
         return pos
 
-    def forward(self, pixel_values, targets=None):
+    def forward(self, pixel_values: torch.Tensor, targets: Optional[List[Dict]] = None) -> Dict[str, torch.Tensor]:
+        # Extract backbone features
         features = self.backbone(pixel_values)
         src = self.input_proj(features['0'])
         B, C, H, W = src.shape
+        
+        # Add positional encoding
         pos_embed = self.build_position_encoding(src)
         src_with_pos = src + pos_embed
+        
+        # Prepare queries and reference points
         query_input = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)
         ref_points = self.ref_point_embed.weight.unsqueeze(0).repeat(B, 1, 1).sigmoid()
+        
+        # Apply transformer
         hs = self.transformer(query_input, src, ref_points, (H, W))
+        
+        # Generate predictions
         outputs_classes = [self.class_embed(h) for h in hs]
         outputs_coords = [self.coord_embed(h).sigmoid().view(B, self.num_queries, self.num_points, 2) for h in hs]
-        out = {'pred_logits': outputs_classes[-1], 'pred_coords': outputs_coords[-1]}
+        
+        out = {
+            'pred_logits': outputs_classes[-1], 
+            'pred_coords': outputs_coords[-1]
+        }
+        
         if self.training and targets is not None:
             indices = self.criterion.matcher(out, targets)
             losses = self.criterion(out, targets, indices=indices)
+            
+            # Add auxiliary losses
             for i, (c, p) in enumerate(zip(outputs_classes[:-1], outputs_coords[:-1])):
                 aux_out = {'pred_logits': c, 'pred_coords': p}
                 aux_losses = self.criterion(aux_out, targets, indices=indices)
@@ -719,10 +993,23 @@ class SSLContourFormer(nn.Module):
                     losses[f"{k}_aux{i}"] = v
             return out, losses
         return out
-# --- END: ContourFormer Head ---
+# --- Head Factory ---
+def get_head(head_type: str, num_classes: int, **kwargs) -> BaseHead:
+    """Factory function to create a segmentation head instance."""
+    head_classes = {
+        'maskrcnn': MaskRCNNHead,
+        'deformable_detr': DeformableDETRHead,
+        'contourformer': ContourFormerHead
+    }
+    
+    if head_type not in head_classes:
+        raise ValueError(f"Unsupported head_type: {head_type}. "
+                        f"Available options: {list(head_classes.keys())}")
+    
+    return head_classes[head_type](num_classes, **kwargs)
 
 
-# --- Step 3: Data Handling ---
+# --- Data Handling ---
 # --- START: ContourFormer Utilities ---
 def masks_to_contours(masks, num_points=50):
     """Convert binary masks to fixed-size contour point sets."""
@@ -942,23 +1229,31 @@ class COCODataModule(pl.LightningDataModule):
     def collate_fn(self, batch): return tuple(zip(*batch))
 
 
-# --- Step 4: PyTorch Lightning Module ---
+# --- PyTorch Lightning Training Module ---
 class SSLSegmentationLightning(pl.LightningModule):
-    def __init__(self, num_classes=80, lr=1e-4, ema_decay=0.999, backbone_type='dino', head_type='maskrcnn', image_size=224, warmup_steps=500, unsup_rampup_steps=5000):
+    def __init__(self, num_classes: int = 80, lr: float = 1e-4, ema_decay: float = 0.999, 
+                 backbone_type: str = 'dino', head_type: str = 'maskrcnn', image_size: int = 224, 
+                 warmup_steps: int = 500, unsup_rampup_steps: int = 5000):
         super().__init__()
         self.save_hyperparameters()
-        if self.hparams.head_type == 'maskrcnn':
-            self.student = GenericMaskRCNN(num_classes, backbone_type=self.hparams.backbone_type, image_size=self.hparams.image_size)
-        elif self.hparams.head_type == 'contourformer':
-             self.student = SSLContourFormer(num_classes, backbone_type=self.hparams.backbone_type, image_size=self.hparams.image_size,hidden_dim=32)
-        elif self.hparams.head_type == 'deformable_detr':
-             self.student = SSLDeformableDETR(num_classes, backbone_type=self.hparams.backbone_type, image_size=self.hparams.image_size)
-        else: raise ValueError(f"Unsupported head_type: {self.hparams.head_type}")
+        
+        # Create student model using the factory pattern
+        head_kwargs = {
+            'backbone_type': backbone_type,
+            'image_size': image_size
+        }
+        
+        # Add head-specific parameters
+        if head_type == 'contourformer':
+            head_kwargs['hidden_dim'] = 32  # Special case for ContourFormer
+            
+        self.student = get_head(head_type, num_classes, **head_kwargs)
+        
+        # Create teacher model as a copy of student
         self.teacher = copy.deepcopy(self.student)
-        for p in self.teacher.parameters(): p.requires_grad = False
+        for p in self.teacher.parameters():
+            p.requires_grad = False
         self.teacher.eval()
-        if self.hparams.head_type == 'deformable_detr':
-            pass  # No special preprocessing needed anymore
 
         self.train_aug = get_transforms(augment=True, image_size=self.hparams.image_size)
         self.val_aug = get_transforms(augment=False, image_size=self.hparams.image_size)
@@ -1363,35 +1658,44 @@ class SSLSegmentationLightning(pl.LightningModule):
         if self.hparams.head_type == 'contourformer':
             self.student.criterion.matcher.step_epoch()
 
-# --- Step 5: Main Execution Block ---
+# --- Main Training Script ---
 def main():
     parser = argparse.ArgumentParser(description="Train a Semi-Supervised Instance Segmentation Model.")
-    parser.add_argument('--backbone', type=str, default='dino', choices=['dino', 'sam', 'swin', 'convnext', 'repvgg', 'resnet'], help="Choose the backbone model.")
-    parser.add_argument('--head', type=str, default='maskrcnn', choices=['maskrcnn', 'contourformer', 'deformable_detr'], help="Choose the segmentation head.")
+    parser.add_argument('--backbone', type=str, default='dino', choices=get_available_backbones(), 
+                       help="Choose the backbone model.")
+    parser.add_argument('--head', type=str, default='maskrcnn', choices=get_available_heads(), 
+                       help="Choose the segmentation head.")
     parser.add_argument('--learning_rate', type=float, default=5e-5, help="Learning rate for the optimizer.")
-    parser.add_argument('--image_size', type=int, default=None, help="Custom image size for resizing. Overrides backbone-specific defaults.")
+    parser.add_argument('--image_size', type=int, default=None, 
+                       help="Custom image size for resizing. Overrides backbone-specific defaults.")
     parser.add_argument('--batch_size', type=int, default=None, help="Override the default batch size.")
     parser.add_argument('--num_workers', type=int, default=4, help="Number of workers for data loading.")
-    parser.add_argument('--fast_dev_run', action='store_true', help="Run a single batch for training and validation to check for errors.")
-    parser.add_argument('--max_steps', type=int, default=-1, help="Total number of training steps to perform. Overrides max_epochs.")
-    parser.add_argument('--num_labeled_images', type=int, default=-1, help="Number of labeled images to use for training. -1 for all.")
-    parser.add_argument('--num_unlabeled_images', type=int, default=-1, help="Number of unlabeled images to use for training. -1 for all.")
-    parser.add_argument('--accumulate_grad_batches', type=int, default=1, help="Accumulate gradients over N batches.")
-    parser.add_argument('--find_unused_parameters', action='store_true', help="Enable 'find_unused_parameters' for DDP. May slightly slow down training.")
-    parser.add_argument('--warmup_steps', type=int, default=500, help="Number of initial steps to train on labeled data only.")
-    parser.add_argument('--unsup_rampup_steps', type=int, default=5000, help="Number of steps to ramp up unsupervised loss weight after warmup.")
+    parser.add_argument('--fast_dev_run', action='store_true', 
+                       help="Run a single batch for training and validation to check for errors.")
+    parser.add_argument('--max_steps', type=int, default=-1, 
+                       help="Total number of training steps to perform. Overrides max_epochs.")
+    parser.add_argument('--num_labeled_images', type=int, default=-1, 
+                       help="Number of labeled images to use for training. -1 for all.")
+    parser.add_argument('--num_unlabeled_images', type=int, default=-1, 
+                       help="Number of unlabeled images to use for training. -1 for all.")
+    parser.add_argument('--accumulate_grad_batches', type=int, default=1, 
+                       help="Accumulate gradients over N batches.")
+    parser.add_argument('--find_unused_parameters', action='store_true', 
+                       help="Enable 'find_unused_parameters' for DDP. May slightly slow down training.")
+    parser.add_argument('--warmup_steps', type=int, default=500, 
+                       help="Number of initial steps to train on labeled data only.")
+    parser.add_argument('--unsup_rampup_steps', type=int, default=5000, 
+                       help="Number of steps to ramp up unsupervised loss weight after warmup.")
     parser.add_argument('--val_every_n_epoch', type=int, default=1, help="Run validation every N epochs.")
     args = parser.parse_args()
-
-    if args.backbone == 'sam':
-        default_image_size = 512
-        default_batch_size = 4
-    else:
-        default_image_size = 224
-        default_batch_size = 8
-
-    image_size = args.image_size if args.image_size is not None else default_image_size
-    batch_size = args.batch_size if args.batch_size is not None else default_batch_size
+    
+    # Get default configuration for the backbone-head combination
+    default_config = get_default_config(args.backbone, args.head)
+    
+    # Apply user overrides or use defaults
+    image_size = args.image_size if args.image_size is not None else default_config['image_size']
+    batch_size = args.batch_size if args.batch_size is not None else default_config['batch_size']
+    precision_setting = default_config['precision']
 
     if args.backbone == 'swin':
         swin_model_name = 'microsoft/swin-base-patch4-window7-224-in22k'
@@ -1405,8 +1709,6 @@ def main():
         except Exception as e:
             print(f"Could not perform Swin Transformer validation check. Error: {e}")
 
-    precision_setting = "32" if args.head in ['contourformer', 'deformable_detr'] or args.backbone in ['repvgg', 'resnet'] else "16-mixed"
-
     print("\n--- Configuration ---")
     print(f"  Backbone:        {args.backbone}")
     print(f"  Head:            {args.head}")
@@ -1414,6 +1716,7 @@ def main():
     print(f"  Batch Size:      {batch_size}")
     print(f"  Learning Rate:   {args.learning_rate}")
     print(f"  Precision:       {precision_setting}")
+    print(f"  Model:           {default_config['backbone']['model_name']}")
     print("---------------------\n")
 
     pl.seed_everything(42)
