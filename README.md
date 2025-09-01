@@ -173,7 +173,15 @@ Most backbone models require downloading from HuggingFace Hub. To enable this:
    HF_TOKEN=your_token ./run_tests.sh
    ```
 
-For GitHub Actions, set the token as a repository secret named `HF_TOKEN`.
+For GitHub Actions, set the token as a repository secret named `HF_TOKEN`:
+
+1. Go to your repository settings
+2. Navigate to "Secrets and variables" → "Actions" 
+3. Click "New repository secret"
+4. Name: `HF_TOKEN`
+5. Value: `your_huggingface_token_here`
+
+The automated tests will run on every push and pull request.
 
 Test results are saved to JSON files for detailed analysis:
 - `tests/quick_test_results.json` - Model instantiation and forward pass results
