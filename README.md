@@ -122,7 +122,7 @@ python visualize_model.py path/to/your/checkpoint.ckpt
 This saves `model_predictions_viz.png` in the same directory.
 ### Example Outputs
 
-Here are some sample predictions from different backbones and heads:
+Here are some sample predictions from different backbones and heads just trained for 5-9 epochs:
 
 | Backbone | Head          | Example Output |
 |----------|---------------|----------------|
