@@ -91,7 +91,9 @@ class SSLSegmentationLightning(pl.LightningModule):
             teacher_preds = self.teacher(pixel_values_u)
         
         # Get student predictions on the same unlabeled images
+        self.student.eval()
         student_preds = self.student(pixel_values_u)
+        self.student.train() # Switch back to train mode for the rest of the training step
         
         # For simplicity, using a placeholder consistency loss.
         # A real implementation would use a more sophisticated loss like Dice or Focal loss on pseudo-masks.
@@ -264,5 +266,5 @@ class SSLSegmentationLightning(pl.LightningModule):
                 "labels": target["labels"].to(self.device),
                 "masks": target["masks"].to(self.device)
             })
-        losses_sup = self.student(images=pixel_values, targets=targets_mrcnn)
+        losses_sup = self.student(pixel_values=pixel_values, targets=targets_mrcnn)
         return sum(losses_sup.values())
