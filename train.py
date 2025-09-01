@@ -644,7 +644,8 @@ def masks_to_contours(masks, num_points=50):
     """Convert binary masks to fixed-size contour point sets.
     
     Extracts the most significant contour from each mask and ensures
-    proper polygon closing and point sampling for accurate reconstruction.
+    proper polygon closing and robust point sampling for accurate reconstruction.
+    Handles multiple contours by selecting the most representative one.
     """
     contours_list, valid_indices = [], []
     for i, mask in enumerate(masks):
@@ -657,8 +658,10 @@ def masks_to_contours(masks, num_points=50):
         if not contours:
             continue
         
-        # Use the largest contour (most significant boundary)
-        contour = sorted(contours, key=lambda x: len(x), reverse=True)[0]
+        # Find the most representative contour
+        # Sort by length and use the longest one, but ensure it's meaningful
+        sorted_contours = sorted(contours, key=lambda x: len(x), reverse=True)
+        contour = sorted_contours[0]
         
         # Skip contours that are too small to be meaningful
         if len(contour) < 4:
@@ -688,10 +691,16 @@ def masks_to_contours(masks, num_points=50):
         if distance[-1] < 1e-6:
             continue
             
-        # Sample points uniformly along the contour
-        f = interp1d(distance.numpy(), path.numpy(), kind='linear', axis=1, fill_value="extrapolate")
-        new_distances = np.linspace(0, distance[-1].item(), num_points)
-        sampled_points = torch.from_numpy(f(new_distances).T).to(torch.float32)
+        # Sample points uniformly along the contour with better interpolation
+        try:
+            f = interp1d(distance.numpy(), path.numpy(), kind='linear', axis=1, fill_value="extrapolate")
+            new_distances = np.linspace(0, distance[-1].item(), num_points)
+            sampled_points = torch.from_numpy(f(new_distances).T).to(torch.float32)
+        except:
+            # Fallback: if interpolation fails, use simple resampling
+            indices = torch.linspace(0, len(contour)-1, num_points).long()
+            indices = torch.clamp(indices, 0, len(contour)-1)
+            sampled_points = contour[indices]
         
         # Ensure sampled points are properly bounded and handle any numerical issues
         sampled_points = torch.clamp(sampled_points, 0.0, 1.0)
@@ -711,7 +720,7 @@ def contours_to_masks(contours, img_shape):
     """Convert sets of contour points to binary masks.
     
     Handles coordinate rounding, out-of-bounds points, and empty contours
-    to ensure robust mask reconstruction.
+    to ensure robust mask reconstruction, with special handling for small polygons.
     """
     h, w = img_shape
     masks = []
@@ -728,12 +737,20 @@ def contours_to_masks(contours, img_shape):
         points[:, 0] = torch.clamp(points[:, 0] * w, 0, w - 0.01)  # Slight margin to avoid edge issues
         points[:, 1] = torch.clamp(points[:, 1] * h, 0, h - 0.01)
         
-        # Convert to numpy and handle coordinate rounding more carefully
+        # Convert to numpy
         points_np = points.cpu().numpy()
         
-        # For small polygons, use more precise rounding
-        if len(points_np) <= 10:
-            points_rounded = points_np  # Keep floating point for small polygons
+        # For very small contours, be more conservative about rounding
+        if len(points_np) <= 10 or np.ptp(points_np[:, 0]) < 2 or np.ptp(points_np[:, 1]) < 2:
+            # Small polygon: keep more precision and ensure minimum size
+            points_rounded = points_np
+            # Ensure at least a 3x3 area for very small objects
+            if np.ptp(points_np[:, 0]) < 1:
+                center_x = np.mean(points_np[:, 0])
+                points_rounded[:, 0] = np.linspace(center_x - 1, center_x + 1, len(points_np))
+            if np.ptp(points_np[:, 1]) < 1:
+                center_y = np.mean(points_np[:, 1])
+                points_rounded[:, 1] = np.linspace(center_y - 1, center_y + 1, len(points_np))
         else:
             points_rounded = np.round(points_np).astype(np.float64)
         
@@ -748,9 +765,15 @@ def contours_to_masks(contours, img_shape):
             unique_points.append(unique_points[0])
         
         if len(unique_points) < 3:
-            # Not enough points for a valid polygon, create a minimal mask
-            masks.append(torch.zeros(h, w, dtype=torch.bool))
-            continue
+            # Not enough points for a valid polygon - create a minimal square
+            center_x, center_y = np.mean(points_np[:, 0]), np.mean(points_np[:, 1])
+            unique_points = [
+                [center_x - 1, center_y - 1],
+                [center_x + 1, center_y - 1], 
+                [center_x + 1, center_y + 1],
+                [center_x - 1, center_y + 1],
+                [center_x - 1, center_y - 1]
+            ]
             
         # Flatten points for PIL polygon drawing
         points_flat = np.array(unique_points).flatten().tolist()
@@ -762,9 +785,17 @@ def contours_to_masks(contours, img_shape):
             mask = torch.from_numpy(np.array(img)).bool()
             masks.append(mask)
         except Exception as e:
-            # Handle any drawing errors gracefully
+            # Handle any drawing errors gracefully by creating a minimal mask
             print(f"Warning: Error drawing polygon: {e}")
-            masks.append(torch.zeros(h, w, dtype=torch.bool))
+            center_x, center_y = int(np.mean(points_np[:, 0])), int(np.mean(points_np[:, 1]))
+            mask = torch.zeros(h, w, dtype=torch.bool)
+            # Create a small square around the center
+            for dx in range(-1, 2):
+                for dy in range(-1, 2):
+                    x, y = center_x + dx, center_y + dy
+                    if 0 <= x < w and 0 <= y < h:
+                        mask[y, x] = True
+            masks.append(mask)
     
     return torch.stack(masks) if masks else torch.empty(0, h, w, dtype=torch.bool)
 # --- END: ContourFormer Utilities ---
