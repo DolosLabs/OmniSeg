@@ -83,6 +83,8 @@ def main():
     parser.add_argument('--unsup_rampup_steps', type=int, default=1000, 
                        help="Number of steps to ramp up unsupervised loss weight after warmup.")
     parser.add_argument('--val_every_n_epoch', type=int, default=1, help="Run validation every N epochs.")
+    parser.add_argument('--use_tiny_data', action='store_true', 
+                       help="Use the tiny synthetic dataset for quick training/testing (run generate_tiny_data.py first).")
     args = parser.parse_args()
     
     # Get default configuration for the backbone-head combination
@@ -113,9 +115,15 @@ def main():
     print(f"Batch size: {batch_size}")
     print(f"Learning rate: {args.learning_rate}")
     print(f"Precision: {precision_setting}")
+    print(f"Use tiny data: {args.use_tiny_data}")
+
+    # Set number of classes based on dataset
+    num_classes = 3 if args.use_tiny_data else NUM_CLASSES
+    print(f"Number of classes: {num_classes}")
 
     # Create run directory
-    run_name = f"{args.backbone}_{args.head}_{image_size}"
+    dataset_suffix = "_tiny" if args.use_tiny_data else ""
+    run_name = f"{args.backbone}_{args.head}_{image_size}{dataset_suffix}"
     run_dir = os.path.join(PROJECT_DIR, 'runs', run_name)
     os.makedirs(run_dir, exist_ok=True)
 
@@ -131,7 +139,7 @@ def main():
     
     # Initialize model
     model = SSLSegmentationLightning(
-        num_classes=NUM_CLASSES, 
+        num_classes=num_classes, 
         lr=args.learning_rate, 
         backbone_type=args.backbone,
         head_type=args.head, 

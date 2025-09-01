@@ -1,6 +1,7 @@
 """Mask R-CNN head implementation."""
 
 from typing import Dict, List, Optional
+from collections import OrderedDict
 import torch
 import torch.nn as nn
 from torchvision.models.detection import MaskRCNN

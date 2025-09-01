@@ -1,4 +1,4 @@
-# visualize_model.py
+# visualize_model_refactored.py
 import os
 import sys
 import argparse
@@ -17,123 +17,141 @@ from pycocotools.coco import COCO
 from types import SimpleNamespace
 import torchvision.transforms.v2 as T
 
-# Adjust the Python path to import from your main script
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-# Import from the modular structure
-from omniseg.config import get_available_backbones, get_default_config
+# Import from our modular structure
+from omniseg.config import PROJECT_DIR
 from omniseg.data import SemiCOCODataset, COCODataModule, get_transforms
+from omniseg.models.base import BaseBackbone, BaseHead
 from omniseg.models.backbones import get_backbone
-from omniseg.models.heads import get_head
-from omniseg.models.heads.contourformer import masks_to_contours, contours_to_masks  
-from omniseg.training import SSLSegmentationLightning, masks_to_boxes
+
+# Import complex classes from original train.py for now
+# Import from the modular structure
+from omniseg.training import SSLSegmentationLightning, masks_to_boxes  
+from omniseg.models.heads.contourformer import masks_to_contours, contours_to_masks
 
 
 def visualize_model(checkpoint_path, project_dir, num_images_to_viz=5):
     """
     Loads a trained model checkpoint and visualizes predictions on a few
-    random validation images.
+    random validation images using our refactored modular structure.
     """
-    print(f"Loading model from checkpoint: {checkpoint_path}")
-    
-    # 1. Load the model from the checkpoint. This automatically sets up the
-    #    architecture and loads the weights.
+    # Load the model from checkpoint
     model = SSLSegmentationLightning.load_from_checkpoint(checkpoint_path)
     model.eval()
-    model.freeze()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-
-    # 2. Instantiate the DataModule to get the validation dataset
-    image_size = model.hparams.image_size
-    coco_datamodule = COCODataModule(project_dir=project_dir, image_size=image_size)
+    
+    # Setup data module using our refactored data classes
+    coco_datamodule = COCODataModule(project_dir=project_dir, batch_size=1, num_workers=0)
     coco_datamodule.prepare_data()
     coco_datamodule.setup()
-    val_dataset = coco_datamodule.val_ds
     
-    print(f"Using validation dataset with {len(val_dataset)} images.")
-
-    # 3. Randomly select a few images from the validation dataset
-    random_indices = random.sample(range(len(val_dataset)), min(num_images_to_viz, len(val_dataset)))
-
-    # 4. Create a figure to plot the visualizations
+    val_dataset = coco_datamodule.val_ds
+    val_transform = get_transforms(augment=False, image_size=model.hparams.image_size)
+    
+    # Randomly sample images
+    random.seed(42)
+    sample_indices = random.sample(range(len(val_dataset)), min(num_images_to_viz, len(val_dataset)))
+    
     fig, axes = plt.subplots(num_images_to_viz, 3, figsize=(15, 5 * num_images_to_viz))
     if num_images_to_viz == 1:
-        axes = axes.reshape(1, 3)
-
-    # 5. Iterate through the selected images, predict, and plot
-    for i, idx in enumerate(random_indices):
+        axes = axes.reshape(1, -1)
+    
+    for i, idx in enumerate(sample_indices):
+        # Get original image and target
         image_pil, target = val_dataset[idx]
-
-        # Get original image size for post-processing
-        img_info = coco_datamodule.coco_gt_val.loadImgs(target['image_id'])[0]
-        original_size = (img_info['height'], img_info['width'])
+        original_size = image_pil.size[::-1]  # (height, width)
         
-        # --- PREDICT ---
+        # Transform for model input
+        image_tensor = val_transform(image_pil).unsqueeze(0)
+        
+        # Get predictions
         with torch.no_grad():
-            pixel_values = model.val_aug(image_pil, None)[0].unsqueeze(0).to(device)
-            outputs = model.student(pixel_values)
+            outputs = model.student(image_tensor)
 
-            # --- Handle different head types for predictions ---
-            if model.hparams.head_type == 'mask2former':
-                outputs_ns = SimpleNamespace(**outputs)
-                results = model.image_processor_m2f.post_process_instance_segmentation(outputs_ns, target_sizes=[original_size])[0]
-                pred_masks = results['segmentation'].cpu().numpy() if 'segmentation' in results else np.zeros((1, original_size[0], original_size[1]))
-            elif model.hparams.head_type == 'maskrcnn':
-                # The output for maskrcnn is a list of dictionaries. We take the first one.
+            # Handle different head types for predictions
+            if model.hparams.head_type == 'maskrcnn':
                 predictions = outputs[0]
                 pred_masks = (predictions["masks"] > 0.5).squeeze(1).cpu().numpy()
+                pred_labels = predictions["labels"].cpu().numpy()
+                pred_scores = predictions["scores"].cpu().numpy()
+                
+                # Filter by confidence
+                keep_mask = pred_scores > 0.5
+                pred_masks = pred_masks[keep_mask]
+                pred_labels = pred_labels[keep_mask]
+                pred_scores = pred_scores[keep_mask]
+                
             elif model.hparams.head_type == 'contourformer':
                 scores = outputs['pred_logits'].softmax(-1)[0, :, :-1]
                 max_scores, labels = scores.max(-1)
-                keep = max_scores > 0.05
-                pred_coords = outputs['pred_coords'][0][keep]
-                if pred_coords.shape[0] > 0:
-                    pred_masks = contours_to_masks(pred_coords, (image_size, image_size))
-                    pred_masks = F.interpolate(pred_masks.unsqueeze(1).float(), size=original_size, mode='bilinear', align_corners=False)[:, 0].bool().cpu().numpy()
-                else:
-                    pred_masks = np.empty((0, original_size[0], original_size[1]), dtype=bool)
-
-        # --- PLOT ---
-        # 1. Original Image
+                
+                keep_mask = max_scores > 0.5
+                pred_contours = outputs['pred_contours'][0][keep_mask].cpu().numpy()
+                pred_labels = labels[keep_mask].cpu().numpy()
+                pred_scores = max_scores[keep_mask].cpu().numpy()
+                
+                # Convert contours to masks
+                pred_masks = contours_to_masks(pred_contours, original_size)
+                
+            else:  # deformable_detr or other DETR variants
+                # Simplified handling for demo
+                pred_masks = np.zeros((1, original_size[0], original_size[1]))
+                pred_labels = np.array([0])
+                pred_scores = np.array([0.0])
+        
+        # Visualize
+        # Original image
         axes[i, 0].imshow(image_pil)
-        axes[i, 0].set_title(f'Original Image {i + 1}', fontsize=10)
+        axes[i, 0].set_title(f"Original Image {idx}")
         axes[i, 0].axis('off')
-
-        # 2. Ground Truth Masks
-        gt_masks = target['masks'].cpu().numpy().astype(bool)
-        ax2 = axes[i, 1]
-        ax2.imshow(image_pil)
-        ax2.set_title(f'Actual Masks {i + 1}', fontsize=10)
-        ax2.axis('off')
-        colors = plt.cm.get_cmap('Paired', len(gt_masks))
-        for k, mask in enumerate(gt_masks):
-            colored_mask = np.zeros((*original_size, 4))
-            color = colors(k)
-            colored_mask[mask] = color
-            ax2.imshow(colored_mask, alpha=0.5)
-
-        # 3. Predicted Masks
-        ax3 = axes[i, 2]
-        ax3.imshow(image_pil)
-        ax3.set_title(f'Predicted Masks {i + 1}', fontsize=10)
-        ax3.axis('off')
-        if pred_masks.ndim == 3 and pred_masks.shape[0] > 0:
-            colors_pred = plt.cm.get_cmap('hsv', pred_masks.shape[0])
-            for k, mask in enumerate(pred_masks):
-                if mask.sum() > 0:
-                    colored_mask = np.zeros((*original_size, 4))
-                    color = colors_pred(k)
-                    colored_mask[mask] = color
-                    ax3.imshow(colored_mask, alpha=0.5)
-
+        
+        # Ground truth masks
+        if 'masks' in target and len(target['masks']) > 0:
+            gt_masks = target['masks'].numpy()
+            combined_gt = np.zeros(original_size + (3,))
+            colors = plt.cm.Set3(np.linspace(0, 1, len(gt_masks)))
+            
+            for mask, color in zip(gt_masks, colors):
+                mask_resized = np.array(Image.fromarray(mask.astype(np.uint8) * 255).resize(image_pil.size[::-1]))
+                for c in range(3):
+                    combined_gt[:, :, c] += (mask_resized > 0) * color[c]
+            
+            combined_gt = np.clip(combined_gt, 0, 1)
+            overlay_gt = 0.6 * np.array(image_pil.resize(original_size[::-1])) / 255.0 + 0.4 * combined_gt
+        else:
+            overlay_gt = np.array(image_pil)
+            
+        axes[i, 1].imshow(overlay_gt)
+        axes[i, 1].set_title(f"Ground Truth ({len(target.get('masks', []))} masks)")
+        axes[i, 1].axis('off')
+        
+        # Predicted masks
+        if len(pred_masks) > 0:
+            combined_pred = np.zeros(original_size + (3,))
+            colors = plt.cm.Set1(np.linspace(0, 1, len(pred_masks)))
+            
+            for mask, color, score in zip(pred_masks, colors, pred_scores):
+                mask_resized = np.array(Image.fromarray((mask > 0.5).astype(np.uint8) * 255).resize((original_size[1], original_size[0])))
+                for c in range(3):
+                    combined_pred[:, :, c] += (mask_resized > 0) * color[c]
+            
+            combined_pred = np.clip(combined_pred, 0, 1)
+            overlay_pred = 0.6 * np.array(image_pil.resize(original_size[::-1])) / 255.0 + 0.4 * combined_pred
+        else:
+            overlay_pred = np.array(image_pil)
+            
+        axes[i, 2].imshow(overlay_pred)
+        axes[i, 2].set_title(f"Predictions ({len(pred_masks)} masks)")
+        axes[i, 2].axis('off')
+    
     plt.tight_layout()
-    output_dir = os.path.dirname(checkpoint_path)
-    viz_path = os.path.join(output_dir, f"model_predictions_viz.png")
-    print(f"Saving visualization to {viz_path}")
-    plt.savefig(viz_path)
+    
+    # Save the visualization
+    output_dir = os.path.join(project_dir, 'visualizations')
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, 'model_predictions_viz.png')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.show()
-    plt.close(fig)
+    
+    print(f"Visualization saved to: {output_path}")
 
 
 if __name__ == '__main__':
