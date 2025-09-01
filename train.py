@@ -465,9 +465,7 @@ class HungarianMatcher(nn.Module):
         indices = []
         for i, c in enumerate(C.split(sizes, -1)):
             # c: [num_queries, num_targets_i]
-            row_ind, col_ind = linear_sum_assignment(c[i].numpy() if isinstance(c, torch.Tensor) else c[i])
-            # NOTE: linear_sum_assignment expects numpy array; c is numpy due to .cpu() but handle shape
-            # Correct call (use c[i].numpy())
+            # NOTE: linear_sum_assignment expects numpy array; c is numpy due to .cpu()
             row_ind, col_ind = linear_sum_assignment(c[i].numpy())
             indices.append((torch.as_tensor(row_ind, dtype=torch.int64), torch.as_tensor(col_ind, dtype=torch.int64)))
 
@@ -1024,6 +1022,11 @@ class SSLSegmentationLightning(pl.LightningModule):
         coco_eval = COCOeval(coco_gt, coco_dt, 'segm'); coco_eval.evaluate(); coco_eval.accumulate(); coco_eval.summarize()
         self.log("val_mAP", coco_eval.stats[0], prog_bar=True, sync_dist=True)
         self.validation_step_outputs.clear()
+
+    def on_train_epoch_end(self):
+        # Step the Hungarian matcher epoch counter for ContourFormer
+        if self.hparams.head_type == 'contourformer':
+            self.student.criterion.matcher.step_epoch()
 
 # --- Step 5: Main Execution Block ---
 # --- Step 5: Main Execution Block ---
