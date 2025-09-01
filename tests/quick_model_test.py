@@ -12,7 +12,10 @@ import traceback
 from typing import Dict, List
 
 # Add the project root to the path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# HuggingFace Hub authentication
+from huggingface_hub import login
 
 from omniseg.config import get_available_backbones, get_available_heads
 from omniseg.models.backbones import get_backbone
@@ -24,6 +27,24 @@ class QuickModelTester:
     
     def __init__(self):
         self.results = {}
+        self._setup_huggingface_auth()
+        
+    def _setup_huggingface_auth(self):
+        """Setup HuggingFace Hub authentication using environment variables."""
+        # Check for HuggingFace token in environment variables
+        hf_token = os.getenv('HF_TOKEN') or os.getenv('HUGGINGFACE_TOKEN')
+        
+        if hf_token:
+            try:
+                login(token=hf_token)
+                print("🔐 HuggingFace Hub authentication successful")
+            except Exception as e:
+                print(f"⚠️  HuggingFace Hub authentication failed: {e}")
+                print("Some model downloads may fail without proper authentication")
+        else:
+            print("⚠️  No HuggingFace token found in environment variables")
+            print("Set HF_TOKEN or HUGGINGFACE_TOKEN environment variable for model downloads")
+            print("Some models may not be accessible without authentication")
         
     def test_backbone_instantiation(self, backbone_type: str) -> Dict:
         """Test if a backbone can be instantiated."""
