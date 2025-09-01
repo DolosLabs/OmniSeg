@@ -403,7 +403,31 @@ class ContourFormerHead(BaseHead, nn.Module):
         self.num_points = num_points
         self.hidden_dim = hidden_dim
         
-        self.backbone = GenericBackboneWithFPN(backbone_type, fpn_out_channels=hidden_dim, dummy_input_size=image_size)
+        # --- FIX #3: ADAPTER LOGIC FOR SIMPLE BACKBONES ---
+        # This logic checks if a complex FPN is needed or if a simple adapter will suffice.
+        self.use_fpn = backbone_type not in ['simple'] # Add other simple backbones here if needed
+
+        if self.use_fpn:
+            self.backbone_net = GenericBackboneWithFPN(backbone_type, fpn_out_channels=hidden_dim, dummy_input_size=image_size)
+            self.adapter = None # FPN handles adaptation
+        else:
+            # For simple backbones, we don't use the FPN wrapper.
+            self.backbone_net = get_backbone(backbone_type)
+            
+            # Discover the output channels of the simple backbone
+            dummy = torch.randn(1, 3, image_size, image_size)
+            with torch.no_grad():
+                backbone_out = self.backbone_net(dummy)
+                # Handle both tensor and dictionary output from simple backbones
+                if isinstance(backbone_out, dict):
+                    backbone_out_channels = list(backbone_out.values())[0].shape[1]
+                else:
+                    backbone_out_channels = backbone_out.shape[1]
+
+            # Create a 1x1 Conv adapter to project features to the required hidden_dim
+            self.adapter = nn.Conv2d(backbone_out_channels, hidden_dim, kernel_size=1)
+        # --- END FIX ---
+
         self.input_proj = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         self.ref_point_embed = nn.Embedding(num_queries, 2)
@@ -456,21 +480,37 @@ class ContourFormerHead(BaseHead, nn.Module):
         return pos
 
     def forward(self, pixel_values: torch.Tensor, targets: Optional[List[Dict]] = None) -> Dict[str, torch.Tensor]:
-        # Extract backbone features
-        features = self.backbone(pixel_values)
-        src = self.input_proj(features['0'])
+        # --- FIX: Use the correct path based on whether we have an FPN or an adapter ---
+        features = self.backbone_net(pixel_values)
+
+        if self.use_fpn:
+            # For complex backbones, take the first feature map from the FPN
+            src = features['0']
+        else:
+            # For simple backbones, adapt the single output feature map
+            if isinstance(features, dict):
+                features = list(features.values())[0]
+            src = self.adapter(features)
+        # --- END FIX ---
+
+        src = self.input_proj(src)
         B, C, H, W = src.shape
         
         # Add positional encoding
         pos_embed = self.build_position_encoding(src)
-        src_with_pos = src + pos_embed
         
+        # --- FIX: Flatten spatial dimensions for the transformer ---
+        # The transformer expects a sequence of shape [Batch, Height*Width, Channels]
+        src_flat = src.flatten(2).permute(0, 2, 1)
+        pos_embed_flat = pos_embed.flatten(2).permute(0, 2, 1)
+        # --- END FIX ---
+
         # Prepare queries and reference points
         query_input = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)
         ref_points = self.ref_point_embed.weight.unsqueeze(0).repeat(B, 1, 1).sigmoid()
         
-        # Apply transformer
-        hs = self.transformer(query_input, src, ref_points, (H, W))
+        # Apply transformer using the flattened features
+        hs = self.transformer(query_input, src_flat + pos_embed_flat, ref_points, (H, W))
         
         # Generate predictions
         outputs_classes = [self.class_embed(h) for h in hs]
