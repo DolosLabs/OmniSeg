@@ -12,8 +12,9 @@ A versatile, semi-supervised instance segmentation framework built on PyTorch Li
   - **Test:** Simple CNN backbone for testing and development
 - **Modular Segmentation Heads:**
   - **Mask R-CNN:** The classic, widely-used two-stage detector.
-  - **ContourFormer:** A custom head that predicts object contours directly.
+  - **ContourFormer:** A custom head that predicts object contours directly. Running but slow convergence.
   - **Deformable DETR:** Advanced DETR-based segmentation head.
+  - **LW-DETR:** Advanced DETR-based segmentation head. Running but slow convergence.
 - **PyTorch Lightning:** Simplifies boilerplate code, ensures reproducibility, and supports distributed training.
 - **Automated Data Handling:** Automatically downloads and prepares the COCO 2017 dataset, or use the tiny synthetic dataset for quick testing.
 
