@@ -90,6 +90,8 @@ class SSLSegmentationLightning(pl.LightningModule):
             sup_loss = self._get_sup_loss_cf(pixel_values_l, targets_l)
         elif self.hparams.head_type == 'deformable_detr':
             sup_loss = self._get_sup_loss_detr(pixel_values_l, targets_l)
+        elif self.hparams.head_type == 'lw_detr':
+            sup_loss = self._get_sup_loss_detr(pixel_values_l, targets_l)
         
         # 2. Unsupervised consistency loss on unlabeled data
         images_u, _ = batch["unlabeled"]
@@ -142,6 +144,9 @@ class SSLSegmentationLightning(pl.LightningModule):
         if self.hparams.head_type == 'maskrcnn':
             preds = self._format_preds_mrcnn(outputs)
         elif self.hparams.head_type == 'deformable_detr':
+            original_sizes = torch.tensor([img.size[::-1] for img in images], device=self.device)
+            preds = self._format_preds_detr(outputs, original_sizes)
+        elif self.hparams.head_type == 'lw_detr':
             original_sizes = torch.tensor([img.size[::-1] for img in images], device=self.device)
             preds = self._format_preds_detr(outputs, original_sizes)
         elif self.hparams.head_type == 'contourformer':
@@ -209,6 +214,7 @@ class SSLSegmentationLightning(pl.LightningModule):
     
             # Filter out low-confidence predictions
             keep = pred_scores > 0.05
+            keep = keep.cpu()
             pred_scores = pred_scores[keep]
             pred_labels = pred_labels[keep]
             pred_masks = pred_masks[keep]
@@ -243,6 +249,7 @@ class SSLSegmentationLightning(pl.LightningModule):
     
             # Filter low-confidence predictions
             keep = pred_scores > 0.05
+            keep = keep.cpu()
             pred_scores = pred_scores[keep]
             pred_labels = pred_labels[keep]
             pred_masks = pred_masks[keep].to(torch.uint8)
