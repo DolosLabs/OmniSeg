@@ -185,44 +185,67 @@ class SSLSegmentationLightning(pl.LightningModule):
         return preds
 
     def _format_preds_detr(self, outputs, original_sizes):
-        processed_preds = self.student.post_process_segmentation(outputs, original_sizes)
-        for pred in processed_preds:
-            pred['masks'] = (pred['masks'] > 0.5).to(torch.uint8)
-        return processed_preds
-
+        preds = []
+        batch_size = outputs['pred_logits'].shape[0]
+    
+        for i in range(batch_size):
+            h, w = original_sizes[i]
+    
+            pred_logits = outputs['pred_logits'][i]        # [num_queries, num_classes+1]
+            pred_masks = outputs['pred_masks'][i]          # [num_queries, H, W]
+    
+            # Remove "no-object" class
+            pred_probs = pred_logits.softmax(-1)[:, :-1]
+            pred_scores, pred_labels = pred_probs.max(-1)
+    
+            # Filter out low-confidence predictions
+            keep = pred_scores > 0.05
+            pred_scores = pred_scores[keep]
+            pred_labels = pred_labels[keep]
+            pred_masks = pred_masks[keep]
+    
+            # Ensure masks are binary and match original image size
+            pred_masks = (pred_masks > 0.5).to(torch.uint8)
+    
+            preds.append({
+                'scores': pred_scores,
+                'labels': pred_labels,
+                'masks': pred_masks,
+                'boxes': masks_to_boxes(pred_masks)
+            })
+    
+        return preds
+        
     def _format_preds_cf(self, outputs, original_sizes):
-            """
-            Correctly formats predictions from ContourFormer's batched dictionary output
-            using the actual model keys 'pred_logits' and 'pred_coords'.
-            """
-            preds = []
-            # Get the batch size from the shape of the 'pred_logits' tensor
-            batch_size = outputs['pred_logits'].shape[0]
-
-            # Loop through each item in the batch
-            for i in range(batch_size):
-                h, w = original_sizes[i]
-
-                # --- FIX: Use the correct keys that we discovered ---
-                pred_logits = outputs['pred_logits'][i]
-                pred_coords = outputs['pred_coords'][i]
-                
-                # --- FIX: Derive scores and labels from the logits ---
-                # Apply softmax to convert logits to probabilities
-                pred_probs = pred_logits.softmax(-1)
-                # The score is the highest probability, and the label is the index of that class
-                pred_scores, pred_labels = pred_probs.max(-1)
-                
-                # Convert the item's predicted contours to masks
-                pred_masks = contours_to_masks(pred_coords, (h.item(), w.item()))
-                
-                preds.append({
-                    'scores': pred_scores,
-                    'labels': pred_labels,
-                    'masks': pred_masks.to(torch.uint8),
-                    'boxes': masks_to_boxes(pred_masks)
-                })
-            return preds
+        preds = []
+        batch_size = outputs['pred_logits'].shape[0]
+    
+        for i in range(batch_size):
+            h, w = original_sizes[i]
+    
+            pred_logits = outputs['pred_logits'][i]
+            pred_coords = outputs['pred_coords'][i]
+    
+            pred_probs = pred_logits.softmax(-1)[:, :-1]  # exclude "no-object" class
+            pred_scores, pred_labels = pred_probs.max(-1)
+    
+            # Convert contours to masks
+            pred_masks = contours_to_masks(pred_coords, (h.item(), w.item()))
+    
+            # Filter low-confidence predictions
+            keep = pred_scores > 0.05
+            pred_scores = pred_scores[keep]
+            pred_labels = pred_labels[keep]
+            pred_masks = pred_masks[keep].to(torch.uint8)
+    
+            preds.append({
+                'scores': pred_scores,
+                'labels': pred_labels,
+                'masks': pred_masks,
+                'boxes': masks_to_boxes(pred_masks)
+            })
+    
+        return preds
 
     # --- FIX: Helper methods for calculating supervised loss ---
     def _get_sup_loss_detr(self, pixel_values, targets):
