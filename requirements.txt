@@ -11,3 +11,4 @@ accelerate
 timm
 scipy
 scikit-image
+matplotlib
