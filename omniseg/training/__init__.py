@@ -148,7 +148,7 @@ class SSLSegmentationLightning(pl.LightningModule):
             preds = self._format_preds_detr(outputs, original_sizes)
         elif self.hparams.head_type == 'lw_detr':
             original_sizes = torch.tensor([img.size[::-1] for img in images], device=self.device)
-            preds = self._format_preds_detr(outputs, original_sizes)
+            preds = self._format_preds_lw_detr(outputs, original_sizes)
         elif self.hparams.head_type == 'contourformer':
             original_sizes = torch.tensor([img.size[::-1] for img in images], device=self.device)
             preds = self._format_preds_cf(outputs, original_sizes)
@@ -197,7 +197,49 @@ class SSLSegmentationLightning(pl.LightningModule):
             pred['masks'] = (pred['masks'] > 0.5).squeeze(1).to(torch.uint8)
             preds.append(pred)
         return preds
-
+        
+    def _format_preds_lw_detr(self, outputs, original_sizes):
+        # This function now correctly processes the advanced DETR-style outputs.
+        preds = []
+        pred_logits = outputs['pred_logits']
+        pred_boxes_normalized = outputs['pred_boxes']
+        pred_masks = outputs['pred_masks']
+        
+        for i in range(pred_logits.shape[0]):
+            h, w = original_sizes[i]
+            
+            # --- FIX IS HERE ---
+            # The new model outputs exactly num_classes logits. Do not slice off the last one.
+            # BEFORE: pred_probs = pred_logits[i].softmax(-1)[:, :-1]
+            # AFTER:
+            pred_probs = pred_logits[i].sigmoid() # For BCE-style losses, sigmoid is more appropriate than softmax
+            # --- END FIX ---
+            
+            pred_scores, pred_labels = pred_probs.max(-1)
+            keep = pred_scores > 0.05
+            keep = keep.cpu()
+            
+            final_boxes = pred_boxes_normalized[i][keep]
+            final_scores = pred_scores[keep]
+            final_labels = pred_labels[keep]
+            final_masks = pred_masks[i][keep]
+    
+            final_boxes = box_convert(final_boxes, in_fmt="cxcywh", out_fmt="xyxy")
+            scale_fct = torch.tensor([w, h, w, h], device=self.device)
+            final_boxes = final_boxes * scale_fct
+    
+            final_masks = F.interpolate(
+                final_masks.unsqueeze(1), size=(h.item(), w.item()),
+                mode="bilinear", align_corners=False
+            ).squeeze(1)
+            final_masks = (final_masks > 0.5).to(torch.uint8)
+    
+            preds.append({
+                'scores': final_scores, 'labels': final_labels,
+                'boxes': final_boxes, 'masks': final_masks,
+            })
+        return preds
+        
     def _format_preds_detr(self, outputs, original_sizes):
         preds = []
         batch_size = outputs['pred_logits'].shape[0]
