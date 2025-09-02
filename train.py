@@ -29,7 +29,7 @@ import torchvision.transforms.v2 as T
 
 import pytorch_lightning as pl
 from pytorch_lightning.utilities.combined_loader import CombinedLoader
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping # MODIFIED: Import EarlyStopping
 from transformers import AutoModel, AutoConfig
 from torchvision.models.detection import MaskRCNN
 from torchvision.models.detection.rpn import AnchorGenerator
@@ -58,33 +58,42 @@ from omniseg.training import SSLSegmentationLightning
 def main():
     parser = argparse.ArgumentParser(description="Train a Semi-Supervised Instance Segmentation Model.")
     parser.add_argument('--backbone', type=str, choices=get_available_backbones(), default='resnet',
-                       help="Choose the backbone model.")
+                        help="Choose the backbone model.")
     parser.add_argument('--head', type=str, choices=get_available_heads(), default='maskrcnn',
-                       help="Choose the segmentation head.")
+                        help="Choose the segmentation head.")
     parser.add_argument('--learning_rate', type=float, default=5e-5, help="Learning rate for the optimizer.")
     parser.add_argument('--image_size', type=int, default=None, 
-                       help="Custom image size for resizing. Overrides backbone-specific defaults.")
+                        help="Custom image size for resizing. Overrides backbone-specific defaults.")
     parser.add_argument('--batch_size', type=int, default=None, help="Override the default batch size.")
     parser.add_argument('--num_workers', type=int, default=2, help="Number of workers for data loading.")
     parser.add_argument('--fast_dev_run', action='store_true', 
-                       help="Run a single batch for training and validation to check for errors.")
+                        help="Run a single batch for training and validation to check for errors.")
     parser.add_argument('--max_steps', type=int, default=-1, 
-                       help="Total number of training steps to perform. Overrides max_epochs.")
+                        help="Total number of training steps to perform. Overrides max_epochs.")
     parser.add_argument('--num_labeled_images', type=int, default=-1, 
-                       help="Number of labeled images to use for training. -1 for all.")
+                        help="Number of labeled images to use for training. -1 for all.")
     parser.add_argument('--num_unlabeled_images', type=int, default=-1, 
-                       help="Number of unlabeled images to use for training. -1 for all.")
+                        help="Number of unlabeled images to use for training. -1 for all.")
     parser.add_argument('--accumulate_grad_batches', type=int, default=1, 
-                       help="Accumulate gradients over N batches.")
+                        help="Accumulate gradients over N batches.")
     parser.add_argument('--find_unused_parameters', action='store_true', 
-                       help="Enable 'find_unused_parameters' for DDP. May slightly slow down training.")
+                        help="Enable 'find_unused_parameters' for DDP. May slightly slow down training.")
     parser.add_argument('--warmup_steps', type=int, default=500, 
-                       help="Number of initial steps to train on labeled data only.")
+                        help="Number of initial steps to train on labeled data only.")
     parser.add_argument('--unsup_rampup_steps', type=int, default=1000, 
-                       help="Number of steps to ramp up unsupervised loss weight after warmup.")
+                        help="Number of steps to ramp up unsupervised loss weight after warmup.")
     parser.add_argument('--val_every_n_epoch', type=int, default=1, help="Run validation every N epochs.")
     parser.add_argument('--use_tiny_data', action='store_true', 
-                       help="Use the tiny synthetic dataset for quick training/testing (run generate_tiny_data.py first).")
+                        help="Use the tiny synthetic dataset for quick training/testing (run generate_tiny_data.py first).")
+    
+    # NEW: Add arguments for early stopping
+    parser.add_argument('--early_stopping_patience', type=int, default=25,
+                        help="Patience for early stopping. Training stops after this many epochs of no improvement.")
+    parser.add_argument('--early_stopping_monitor', type=str, default='val_mAP',
+                        help="Metric to monitor for early stopping.")
+    parser.add_argument('--early_stopping_mode', type=str, choices=['min', 'max'], default='max',
+                        help="Mode for early stopping ('min' for loss, 'max' for accuracy/mAP).")
+    
     args = parser.parse_args()
     
     # Get default configuration for the backbone-head combination
@@ -116,6 +125,8 @@ def main():
     print(f"Learning rate: {args.learning_rate}")
     print(f"Precision: {precision_setting}")
     print(f"Use tiny data: {args.use_tiny_data}")
+    print(f"Early Stopping Patience: {args.early_stopping_patience} epochs monitoring '{args.early_stopping_monitor}'")
+
 
     # Set number of classes based on dataset
     num_classes = 3 if args.use_tiny_data else NUM_CLASSES
@@ -158,6 +169,14 @@ def main():
         save_last=True
     )
     
+    # NEW: Instantiate the EarlyStopping callback
+    early_stopping_callback = EarlyStopping(
+        monitor=args.early_stopping_monitor,
+        patience=args.early_stopping_patience,
+        mode=args.early_stopping_mode,
+        verbose=True
+    )
+    
     strategy = "ddp_find_unused_parameters_true" if args.find_unused_parameters else "ddp"
 
     trainer = pl.Trainer(
@@ -168,7 +187,8 @@ def main():
         strategy=strategy,
         accumulate_grad_batches=args.accumulate_grad_batches,
         check_val_every_n_epoch=args.val_every_n_epoch,
-        callbacks=[checkpoint_callback],
+        # MODIFIED: Add the early stopping callback to the list
+        callbacks=[checkpoint_callback, early_stopping_callback],
         log_every_n_steps=10,
         precision=precision_setting,
         default_root_dir=run_dir,
