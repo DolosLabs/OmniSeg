@@ -25,9 +25,9 @@ ANNOTATIONS_DIR = os.path.join(BASE_DIR, "annotations")
 
 CANVAS_SIZE = (64, 64)
 SHAPES_PER_IMAGE = (2, 5)  # min-max
-N_TRAIN = 1000
-N_VAL = 200
-N_TEST = 200
+N_TRAIN = 20000
+N_VAL = 1000
+N_TEST = 1000
 MIN_MASK_PIXELS = 10  # Skip tiny masks
 
 # Shape categories
@@ -91,6 +91,31 @@ def draw_triangle(draw, center, size, color):
     draw.polygon(points, fill=color)
     return True
 
+def sample_even_positions(num_shapes, grid_size=(3, 3), margin=8):
+    """
+    Place shapes more evenly by dividing the canvas into grid cells.
+    Picks random distinct grid cells for each shape.
+    """
+    rows, cols = grid_size
+    cells = [(r, c) for r in range(rows) for c in range(cols)]
+    random.shuffle(cells)
+
+    chosen_cells = cells[:num_shapes]
+    positions = []
+    for (r, c) in chosen_cells:
+        cell_w = CANVAS_SIZE[0] // cols
+        cell_h = CANVAS_SIZE[1] // rows
+
+        x_min = c * cell_w + margin
+        x_max = (c + 1) * cell_w - margin
+        y_min = r * cell_h + margin
+        y_max = (r + 1) * cell_h - margin
+
+        center_x = random.randint(x_min, x_max)
+        center_y = random.randint(y_min, y_max)
+        positions.append((center_x, center_y))
+    return positions
+
 def generate_shapes_image():
     """Generate a single image with random shapes"""
     # Create blank canvas
@@ -101,8 +126,9 @@ def generate_shapes_image():
     num_shapes = random.randint(*SHAPES_PER_IMAGE)
     
     shapes_info = []
-    
-    for shape_id in range(num_shapes):
+    positions = sample_even_positions(num_shapes)
+
+    for shape_id, center in enumerate(positions):
         # Choose random shape type
         shape_type = random.choice(['circle', 'rectangle', 'triangle'])
         category_id = next(cat['id'] for cat in CATEGORIES if cat['name'] == shape_type)
@@ -110,12 +136,6 @@ def generate_shapes_image():
         # Random color (grayscale for simplicity)
         color_val = random.randint(50, 255)
         color = (color_val, color_val, color_val)
-        
-        # Random position (avoid edges)
-        margin = 30
-        center_x = random.randint(margin, CANVAS_SIZE[0] - margin)
-        center_y = random.randint(margin, CANVAS_SIZE[1] - margin)
-        center = (center_x, center_y)
         
         # Create mask for this shape
         shape_canvas = Image.new('L', CANVAS_SIZE, color=0)
