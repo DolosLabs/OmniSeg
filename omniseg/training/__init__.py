@@ -199,7 +199,6 @@ class SSLSegmentationLightning(pl.LightningModule):
         return preds
         
     def _format_preds_lw_detr(self, outputs, original_sizes):
-        # This function now correctly processes the advanced DETR-style outputs.
         preds = []
         pred_logits = outputs['pred_logits']
         pred_boxes_normalized = outputs['pred_boxes']
@@ -208,35 +207,42 @@ class SSLSegmentationLightning(pl.LightningModule):
         for i in range(pred_logits.shape[0]):
             h, w = original_sizes[i]
             
-            # --- FIX IS HERE ---
-            # The new model outputs exactly num_classes logits. Do not slice off the last one.
-            # BEFORE: pred_probs = pred_logits[i].softmax(-1)[:, :-1]
-            # AFTER:
-            pred_probs = pred_logits[i].sigmoid() # For BCE-style losses, sigmoid is more appropriate than softmax
-            # --- END FIX ---
+            # Apply sigmoid to get probabilities
+            pred_probs = pred_logits[i].sigmoid()
             
-            pred_scores, pred_labels = pred_probs.max(-1)
-            keep = pred_scores > 0.05
-            keep = keep.cpu()
+            # --- THE CORRECTED LOGIC IS HERE ---
+            # Instead of `max(-1)`, we apply a threshold to the entire probability matrix
+            keep = pred_probs > 0.05
             
-            final_boxes = pred_boxes_normalized[i][keep]
-            final_scores = pred_scores[keep]
-            final_labels = pred_labels[keep]
-            final_masks = pred_masks[i][keep]
+            # `torch.where` gives us the indices (query_idx, class_idx) for all predictions above the threshold
+            query_indices, pred_labels = torch.where(keep)
+            
+            # Now, gather the corresponding scores and boxes
+            pred_scores = pred_probs[keep]
+            final_boxes = pred_boxes_normalized[i][query_indices]
+            final_masks = pred_masks[i][query_indices]
+            
+            # --- END OF CORRECTED LOGIC ---
     
+            # Post-processing remains the same for normalization and scaling
             final_boxes = box_convert(final_boxes, in_fmt="cxcywh", out_fmt="xyxy")
             scale_fct = torch.tensor([w, h, w, h], device=self.device)
             final_boxes = final_boxes * scale_fct
-    
-            final_masks = F.interpolate(
-                final_masks.unsqueeze(1), size=(h.item(), w.item()),
-                mode="bilinear", align_corners=False
-            ).squeeze(1)
-            final_masks = (final_masks > 0.5).to(torch.uint8)
+            
+            if final_masks.shape[0] > 0:
+                final_masks = F.interpolate(
+                    final_masks.unsqueeze(1), size=(h.item(), w.item()),
+                    mode="bilinear", align_corners=False
+                ).squeeze(1)
+                final_masks = (final_masks > 0.5).to(torch.uint8)
+            else:
+                final_masks = torch.empty((0, h, w), device=self.device, dtype=torch.uint8)
     
             preds.append({
-                'scores': final_scores, 'labels': final_labels,
-                'boxes': final_boxes, 'masks': final_masks,
+                'scores': pred_scores, 
+                'labels': pred_labels,
+                'boxes': final_boxes, 
+                'masks': final_masks,
             })
         return preds
         
