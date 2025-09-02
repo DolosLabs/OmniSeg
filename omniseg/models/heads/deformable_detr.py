@@ -224,21 +224,32 @@ class DeformableDETRHead(BaseHead, nn.Module):
         )
 
     def forward(self, pixel_values: torch.Tensor, targets: Optional[List[Dict]] = None) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass for Deformable DETR head.
+        
+        Args:
+            pixel_values: Input images, shape [B, 3, H, W]
+            targets: Optional list of dicts with 'boxes', 'labels', 'masks'
+    
+        Returns:
+            outputs: Dict containing 'pred_logits', 'pred_boxes', 'pred_masks', and optionally 'aux_outputs'
+            losses: Dict of losses if targets are provided
+        """
         # 1. Extract backbone features
         feature_maps = self.backbone(pixel_values)
         
         # 2. Use the finest feature map as memory for the transformer
-        finest_features = feature_maps['0']  # Shape: [B, d_model, H, W]
-        B, C, H, W = finest_features.shape
+        finest_features = feature_maps['0']  # Shape: [B, d_model, H_f, W_f]
+        B, C, H_f, W_f = finest_features.shape
         
         # Flatten spatial dimensions for transformer
-        memory = finest_features.flatten(2).transpose(1, 2)  # [B, H*W, d_model]
+        memory = finest_features.flatten(2).transpose(1, 2)  # [B, H_f*W_f, d_model]
         
         # 3. Get query embeddings
         query_embeds = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)  # [B, num_queries, d_model]
         
         # 4. Apply transformer decoder
-        memory_key_padding_mask = torch.zeros(B, H*W, dtype=torch.bool, device=pixel_values.device)
+        memory_key_padding_mask = torch.zeros(B, H_f*W_f, dtype=torch.bool, device=pixel_values.device)
         
         decoder_output = self.transformer_decoder(
             tgt=query_embeds,
@@ -249,10 +260,18 @@ class DeformableDETRHead(BaseHead, nn.Module):
         # 5. Apply prediction heads
         logits = self.class_embed(decoder_output)
         pred_boxes = self.bbox_embed(decoder_output).sigmoid()
-        mask_embeds = self.mask_head(decoder_output)
+        mask_embeds = self.mask_head(decoder_output)  # [B, num_queries, d_model]
         
         # 6. Compute mask predictions using finest feature map
-        pred_masks = (mask_embeds @ finest_features.view(B, C, H * W)).view(B, -1, H, W)
+        pred_masks_lowres = (mask_embeds @ finest_features.view(B, C, H_f * W_f)).view(B, -1, H_f, W_f)
+        
+        # 7. Upsample masks to match input image size
+        pred_masks = F.interpolate(
+            pred_masks_lowres,
+            size=(pixel_values.shape[2], pixel_values.shape[3]),
+            mode='bilinear',
+            align_corners=False
+        )
         
         outputs = {
             "pred_logits": logits,
@@ -264,4 +283,5 @@ class DeformableDETRHead(BaseHead, nn.Module):
         if targets is not None:
             losses = self.criterion(outputs, targets)
             return outputs, losses
+        
         return outputs
