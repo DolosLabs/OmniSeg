@@ -53,7 +53,7 @@ def process_predictions(model_hparams: Dict[str, Any], raw_outputs: Any, origina
         }
         
     elif head_type == 'contourformer':
-        # Handle tuple vs dict outputs
+        # Handle tuple vs dict outputs more robustly
         if isinstance(raw_outputs, (tuple, list)) and len(raw_outputs) == 2:
             logits, contours = raw_outputs
         elif isinstance(raw_outputs, dict):
@@ -69,24 +69,106 @@ def process_predictions(model_hparams: Dict[str, Any], raw_outputs: Any, origina
                 print("Dict keys:", list(raw_outputs.keys()))
             else:
                 print("Type:", type(raw_outputs))
-            raise ValueError("ContourFormer outputs missing 'logits' or 'contours/coords'")
+            # Return empty predictions instead of raising error
+            return {
+                "masks": np.array([]).reshape(0, *original_size),
+                "labels": np.array([]),
+                "scores": np.array([])
+            }
 
-        scores_softmax = logits.softmax(-1)[0, :, :-1]
-        scores, labels = scores_softmax.max(-1)
-        keep_mask = scores > CONFIDENCE_THRESHOLD
+        # Fix: More robust tensor processing for distributed trained models
+        try:
+            # Handle both single and multi-GPU trained models
+            if logits.dim() == 3:  # [batch, queries, classes]
+                scores_softmax = logits.softmax(-1)[0, :, :-1]
+            elif logits.dim() == 2:  # [queries, classes] (already squeezed)
+                scores_softmax = logits.softmax(-1)[:, :-1]
+            else:
+                raise ValueError(f"Unexpected logits shape: {logits.shape}")
+                
+            scores, labels = scores_softmax.max(-1)
+            keep_mask = scores > CONFIDENCE_THRESHOLD
 
-        contours_np = contours[0][keep_mask].detach().cpu()
+            if contours.dim() == 4:  # [batch, queries, points, 2]
+                contours_np = contours[0][keep_mask].detach().cpu()
+            elif contours.dim() == 3:  # [queries, points, 2] (already squeezed)
+                contours_np = contours[keep_mask].detach().cpu()
+            else:
+                raise ValueError(f"Unexpected contours shape: {contours.shape}")
 
-        return {
-            "masks": contours_to_masks(contours_np, original_size),
-            "labels": labels[keep_mask].detach().cpu().numpy(),
-            "scores": scores[keep_mask].detach().cpu().numpy()
-        }
+            # Convert contours to masks
+            masks = contours_to_masks(contours_np, original_size)
+            
+            return {
+                "masks": masks.numpy() if isinstance(masks, torch.Tensor) else masks,
+                "labels": labels[keep_mask].detach().cpu().numpy(),
+                "scores": scores[keep_mask].detach().cpu().numpy()
+            }
+        except Exception as e:
+            print(f"Error processing ContourFormer outputs: {e}")
+            return {
+                "masks": np.array([]).reshape(0, *original_size),
+                "labels": np.array([]),
+                "scores": np.array([])
+            }
+
+    elif head_type == 'deformable_detr':
+        # Add DETR processing support
+        try:
+            if isinstance(raw_outputs, dict):
+                logits = raw_outputs.get("pred_logits")
+                masks = raw_outputs.get("pred_masks")
+                
+                if logits is not None and masks is not None:
+                    # Handle batch dimension
+                    if logits.dim() == 3:  # [batch, queries, classes]
+                        logits = logits[0]  # Take first batch item
+                    if masks.dim() == 4:   # [batch, queries, H, W]
+                        masks = masks[0]   # Take first batch item
+                    
+                    # Process predictions
+                    scores_softmax = logits.softmax(-1)[:, :-1]  # Remove no-object class
+                    scores, labels = scores_softmax.max(-1)
+                    keep_mask = scores > CONFIDENCE_THRESHOLD
+                    
+                    # Resize masks to original size
+                    selected_masks = masks[keep_mask]
+                    if len(selected_masks) > 0:
+                        import torch.nn.functional as F
+                        resized_masks = F.interpolate(
+                            selected_masks.unsqueeze(0), 
+                            size=original_size, 
+                            mode='bilinear', 
+                            align_corners=False
+                        ).squeeze(0)
+                        binary_masks = (resized_masks > 0.5).cpu().numpy()
+                    else:
+                        binary_masks = np.array([]).reshape(0, *original_size)
+                    
+                    return {
+                        "masks": binary_masks,
+                        "labels": labels[keep_mask].detach().cpu().numpy(),
+                        "scores": scores[keep_mask].detach().cpu().numpy()
+                    }
+            
+            # Fallback for unexpected DETR format
+            return {
+                "masks": np.array([]).reshape(0, *original_size),
+                "labels": np.array([]),
+                "scores": np.array([])
+            }
+        except Exception as e:
+            print(f"Error processing DETR outputs: {e}")
+            return {
+                "masks": np.array([]).reshape(0, *original_size),
+                "labels": np.array([]),
+                "scores": np.array([])
+            }
 
     else:  # Fallback for other heads
         print(f"Warning: Unsupported head type '{head_type}'. Returning empty predictions.")
         return {
-            "masks": np.array([]),
+            "masks": np.array([]).reshape(0, *original_size),
             "labels": np.array([]),
             "scores": np.array([])
         }
@@ -124,7 +206,34 @@ def visualize_model(checkpoint_path: str, project_dir: str, num_images: int):
 
     device = get_device()
     
-    model = SSLSegmentationLightning.load_from_checkpoint(checkpoint_path, map_location=device)
+    # Fix: Handle models trained with DDP by properly loading state dict
+    try:
+        model = SSLSegmentationLightning.load_from_checkpoint(checkpoint_path, map_location=device)
+    except Exception as e:
+        print(f"Direct loading failed ({e}), trying to fix DDP checkpoint...")
+        # Load the checkpoint manually and remove DDP wrapper keys if present
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        # Remove 'module.' prefix from state_dict keys if present (common in DDP)
+        state_dict = checkpoint.get('state_dict', checkpoint)
+        fixed_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('module.'):
+                new_key = key[7:]  # Remove 'module.' prefix
+            else:
+                new_key = key
+            fixed_state_dict[new_key] = value
+        
+        # Update the checkpoint
+        checkpoint['state_dict'] = fixed_state_dict
+        
+        # Save temporary fixed checkpoint
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.ckpt', delete=False) as tmp_file:
+            torch.save(checkpoint, tmp_file.name)
+            model = SSLSegmentationLightning.load_from_checkpoint(tmp_file.name, map_location=device)
+            os.unlink(tmp_file.name)  # Clean up temp file
+    
     model.eval()
 
     datamodule = COCODataModule(project_dir=project_dir, batch_size=1, num_workers=0)
@@ -149,8 +258,21 @@ def visualize_model(checkpoint_path: str, project_dir: str, num_images: int):
         image_tensor = val_transform(image_pil).unsqueeze(0).to(device)
         
         with torch.no_grad():
+            # Ensure model is in eval mode and on correct device
+            model.to(device)
             raw_outputs = model.student(image_tensor)
-            predictions = process_predictions(model.hparams, raw_outputs, original_size)
+            
+            # Fix: Handle different output formats more robustly
+            try:
+                predictions = process_predictions(model.hparams, raw_outputs, original_size)
+            except Exception as e:
+                print(f"Warning: Error processing predictions for image {idx}: {e}")
+                # Provide empty predictions as fallback
+                predictions = {
+                    "masks": np.array([]),
+                    "labels": np.array([]),
+                    "scores": np.array([])
+                }
 
         axes[i, 0].imshow(image_pil)
         axes[i, 0].set_title(f"Original Image (Index: {idx})")

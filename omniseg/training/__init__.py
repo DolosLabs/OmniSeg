@@ -63,6 +63,15 @@ class SSLSegmentationLightning(pl.LightningModule):
         for t_param, s_param in zip(self.teacher.parameters(), self.student.parameters()):
             t_param.data.mul_(self.hparams.ema_decay).add_(s_param.data, alpha=1 - self.hparams.ema_decay)
 
+    def on_train_epoch_start(self):
+        """Called at the beginning of each training epoch."""
+        super().on_train_epoch_start()
+        
+        # Update epoch counter for Hungarian matcher (ContourFormer and DETR)
+        if hasattr(self.student, 'criterion') and hasattr(self.student.criterion, 'matcher'):
+            if hasattr(self.student.criterion.matcher, 'step_epoch'):
+                self.student.criterion.matcher.step_epoch()
+
     def on_before_optimizer_step(self, optimizer):
         self._update_teacher()
 

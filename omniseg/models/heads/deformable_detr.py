@@ -140,9 +140,15 @@ class SetCriterionDETR(nn.Module):
         indices = self.matcher(outputs_without_aux, targets)
         num_boxes = sum(len(t["labels"]) for t in targets)
         num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
+        
+        # Fix: More robust distributed training support
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.all_reduce(num_boxes)
-        num_boxes = torch.clamp(num_boxes / (torch.distributed.get_world_size() if torch.distributed.is_available() and torch.distributed.is_initialized() else 1), min=1).item()
+            torch.distributed.all_reduce(num_boxes, op=torch.distributed.ReduceOp.SUM)
+            world_size = torch.distributed.get_world_size()
+        else:
+            world_size = 1
+            
+        num_boxes = torch.clamp(num_boxes / max(world_size, 1), min=1).item()
         losses = {}
         for loss in ['labels', 'boxes', 'masks']:
             losses.update(getattr(self, f"loss_{loss}")(outputs, targets, indices, num_boxes))

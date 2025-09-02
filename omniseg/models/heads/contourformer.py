@@ -171,28 +171,56 @@ class HungarianMatcher(nn.Module):
         self.warmup_epochs = warmup_epochs
 
     def step_epoch(self):
+        """Step the epoch counter, ensuring synchronization in distributed training."""
         self.epoch += 1
+        
+        # Ensure epoch synchronization in distributed training
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            # Create a tensor with the current epoch and broadcast from rank 0
+            epoch_tensor = torch.tensor(self.epoch, device='cuda' if torch.cuda.is_available() else 'cpu', dtype=torch.long)
+            torch.distributed.broadcast(epoch_tensor, src=0)
+            self.epoch = epoch_tensor.item()
 
     @torch.no_grad()
     def forward(self, outputs, targets):
         bs, num_queries = outputs["pred_logits"].shape[:2]
+        
+        # Handle empty targets case for distributed training
+        if not targets or all(len(t.get("labels", [])) == 0 for t in targets):
+            # Return empty matches for all batch items
+            return [(torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64)) for _ in range(bs)]
+        
         out_prob = (outputs["pred_logits"].flatten(0, 1) / 0.7).softmax(-1)
         out_points = outputs["pred_coords"].flatten(0, 1)
-        tgt_ids = torch.cat([v["labels"] for v in targets])
-        tgt_points = torch.cat([v["coords"] for v in targets])
+        
+        tgt_ids = torch.cat([v["labels"] for v in targets if len(v["labels"]) > 0])
+        tgt_points = torch.cat([v["coords"] for v in targets if len(v["coords"]) > 0])
+        
+        # Handle edge case where there are no valid targets
+        if len(tgt_ids) == 0:
+            return [(torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64)) for _ in range(bs)]
+        
         cost_class = -out_prob[:, tgt_ids]
         cost_point = torch.cdist(out_points.flatten(1), tgt_points.flatten(1), p=1)
+        
         if self.epoch < self.warmup_epochs:
             C = cost_point
         else:
             cost_point_w = max(self.base_cost_point, self.cost_point_init * (self.cost_decay ** self.epoch))
             C = self.base_cost_class * cost_class + cost_point_w * cost_point
+        
         C = C.view(bs, num_queries, -1).cpu()
         sizes = [len(v["coords"]) for v in targets]
         indices = []
+        
         for i, c in enumerate(C.split(sizes, -1)):
-            row_ind, col_ind = linear_sum_assignment(c[i].numpy())
-            indices.append((torch.as_tensor(row_ind, dtype=torch.int64), torch.as_tensor(col_ind, dtype=torch.int64)))
+            if sizes[i] == 0:
+                # No targets for this batch item
+                indices.append((torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64)))
+            else:
+                row_ind, col_ind = linear_sum_assignment(c[i].numpy())
+                indices.append((torch.as_tensor(row_ind, dtype=torch.int64), torch.as_tensor(col_ind, dtype=torch.int64)))
+        
         return indices
 
 
@@ -243,12 +271,18 @@ class SetCriterionContourFormer(nn.Module):
             indices = self.matcher(outputs, targets)
         num_instances = sum(len(t["labels"]) for t in targets)
         num_instances = torch.as_tensor([num_instances], dtype=torch.float, device=next(iter(outputs.values())).device)
+        
+        # Fix: More robust distributed training support
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.all_reduce(num_instances)
+            # Use proper reduction operation for distributed training
+            torch.distributed.all_reduce(num_instances, op=torch.distributed.ReduceOp.SUM)
             world_size = torch.distributed.get_world_size()
         else:
             world_size = 1
-        num_instances = torch.clamp(num_instances / world_size, min=1).item()
+        
+        # Ensure proper normalization across all processes
+        num_instances = torch.clamp(num_instances / max(world_size, 1), min=1).item()
+        
         losses = {}
         losses.update(self.loss_labels(outputs, targets, indices, num_instances))
         losses.update(self.loss_points(outputs, targets, indices, num_instances))
@@ -348,45 +382,80 @@ def contours_to_masks(contours, img_shape):
     """Convert sets of contour points to binary masks."""
     h, w = img_shape
     masks = []
+    
+    # Handle empty contours case
+    if len(contours) == 0 or (hasattr(contours, 'numel') and contours.numel() == 0):
+        return torch.empty(0, h, w, dtype=torch.bool)
+    
     for contour_set in contours:
         if contour_set.numel() == 0:
-            masks.append(torch.zeros(h, w, dtype=torch.bool)); continue
+            masks.append(torch.zeros(h, w, dtype=torch.bool))
+            continue
+            
         points = contour_set.clone()
-        points[:, 0] = torch.clamp(points[:, 0] * w, 0, w - 0.01)
-        points[:, 1] = torch.clamp(points[:, 1] * h, 0, h - 0.01)
+        
+        # Fix: More robust coordinate clamping
+        points[:, 0] = torch.clamp(points[:, 0] * w, 0, max(w - 0.01, 0))
+        points[:, 1] = torch.clamp(points[:, 1] * h, 0, max(h - 0.01, 0))
+        
         points_np = points.cpu().numpy()
+        
+        # Handle degenerate cases more robustly
         if len(points_np) <= 10 or np.ptp(points_np[:, 0]) < 2 or np.ptp(points_np[:, 1]) < 2:
-            points_rounded = points_np
+            points_rounded = points_np.copy()
             if np.ptp(points_np[:, 0]) < 1:
                 center_x = np.mean(points_np[:, 0])
-                points_rounded[:, 0] = np.linspace(center_x - 1, center_x + 1, len(points_np))
+                points_rounded[:, 0] = np.linspace(max(center_x - 1, 0), min(center_x + 1, w-1), len(points_np))
             if np.ptp(points_np[:, 1]) < 1:
                 center_y = np.mean(points_np[:, 1])
-                points_rounded[:, 1] = np.linspace(center_y - 1, center_y + 1, len(points_np))
+                points_rounded[:, 1] = np.linspace(max(center_y - 1, 0), min(center_y + 1, h-1), len(points_np))
         else:
             points_rounded = np.round(points_np).astype(np.float64)
+        
+        # Fix: More robust point uniqueness check
         unique_points = [points_rounded[0]]
         for point in points_rounded[1:]:
-            if not np.allclose(point, unique_points[-1], atol=0.5): unique_points.append(point)
+            if not np.allclose(point, unique_points[-1], atol=0.5):
+                unique_points.append(point)
+        
+        # Ensure polygon is closed
         if len(unique_points) >= 3 and not np.allclose(unique_points[0], unique_points[-1], atol=0.5):
             unique_points.append(unique_points[0])
+        
+        # Fallback for insufficient points
         if len(unique_points) < 3:
             center_x, center_y = np.mean(points_np[:, 0]), np.mean(points_np[:, 1])
-            unique_points = [[center_x - 1, center_y - 1],[center_x + 1, center_y - 1],[center_x + 1, center_y + 1],[center_x - 1, center_y + 1],[center_x - 1, center_y - 1]]
+            size = max(1, min(w//10, h//10))  # Adaptive size based on image dimensions
+            unique_points = [
+                [max(center_x - size, 0), max(center_y - size, 0)],
+                [min(center_x + size, w-1), max(center_y - size, 0)], 
+                [min(center_x + size, w-1), min(center_y + size, h-1)],
+                [max(center_x - size, 0), min(center_y + size, h-1)],
+                [max(center_x - size, 0), max(center_y - size, 0)]
+            ]
+        
         points_flat = np.array(unique_points).flatten().tolist()
+        
+        # More robust mask creation
         try:
             img = Image.new('L', (w, h), 0)
             ImageDraw.Draw(img).polygon(points_flat, outline=1, fill=1)
-            masks.append(torch.from_numpy(np.array(img)).bool())
+            mask = torch.from_numpy(np.array(img)).bool()
+            masks.append(mask)
         except Exception as e:
             print(f"Warning: Error drawing polygon: {e}")
+            # Robust fallback: create a small mask around the center
             center_x, center_y = int(np.mean(points_np[:, 0])), int(np.mean(points_np[:, 1]))
             mask = torch.zeros(h, w, dtype=torch.bool)
-            for dx in range(-1, 2):
-                for dy in range(-1, 2):
+            
+            # Create a small cross pattern around the center
+            for dx in range(-2, 3):
+                for dy in range(-2, 3):
                     x, y = center_x + dx, center_y + dy
-                    if 0 <= x < w and 0 <= y < h: mask[y, x] = True
+                    if 0 <= x < w and 0 <= y < h:
+                        mask[y, x] = True
             masks.append(mask)
+    
     return torch.stack(masks) if masks else torch.empty(0, h, w, dtype=torch.bool)
 
 
