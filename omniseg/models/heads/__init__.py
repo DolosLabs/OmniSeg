@@ -3,16 +3,18 @@
 from typing import Dict, Any
 from ..base import BaseHead
 from .maskrcnn import MaskRCNNHead
-from .deformable_detr import DeformableDETRHead
+from .deformable_detr import DETRSegmentationHead
 from .contourformer import ContourFormerHead
+from .lw_detr import LWDETRHead
 
 
 def get_head(head_type: str, num_classes: int, **kwargs) -> BaseHead:
     """Factory function to create a segmentation head instance."""
     head_classes = {
         'maskrcnn': MaskRCNNHead,
-        'deformable_detr': DeformableDETRHead,
-        'contourformer': ContourFormerHead
+        'deformable_detr': DETRSegmentationHead,
+        'contourformer': ContourFormerHead,
+        'lw_detr': LWDETRHead
     }
     
     if head_type not in head_classes:
@@ -25,7 +27,8 @@ def get_head(head_type: str, num_classes: int, **kwargs) -> BaseHead:
 __all__ = [
     'BaseHead',
     'MaskRCNNHead',
-    'DeformableDETRHead', 
+    'DETRSegmentationHead', 
     'ContourFormerHead',
+    'LWDETRSegmentationHead',
     'get_head'
 ]
