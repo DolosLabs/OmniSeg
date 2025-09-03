@@ -199,52 +199,39 @@ class SSLSegmentationLightning(pl.LightningModule):
         return preds
         
     def _format_preds_lw_detr(self, outputs, original_sizes):
-        preds = []
-        pred_logits = outputs['pred_logits']
-        pred_boxes_normalized = outputs['pred_boxes']
-        pred_masks = outputs['pred_masks']
+        """
+        Post-processes LW-DETR outputs into scaled boxes, labels, scores, and masks.
+        """
+        logits, boxes_norm, masks_logits = outputs["pred_logits"], outputs["pred_boxes"], outputs["pred_masks"]
         
-        for i in range(pred_logits.shape[0]):
-            h, w = original_sizes[i]
-            
-            # Apply sigmoid to get probabilities
-            pred_probs = pred_logits[i].sigmoid()
-            
-            # --- THE CORRECTED LOGIC IS HERE ---
-            # Instead of `max(-1)`, we apply a threshold to the entire probability matrix
-            keep = pred_probs > 0.05
-            
-            # `torch.where` gives us the indices (query_idx, class_idx) for all predictions above the threshold
-            query_indices, pred_labels = torch.where(keep)
-            
-            # Now, gather the corresponding scores and boxes
-            pred_scores = pred_probs[keep]
-            final_boxes = pred_boxes_normalized[i][query_indices]
-            final_masks = pred_masks[i][query_indices]
-            
-            # --- END OF CORRECTED LOGIC ---
+        results = []
+        for i, (h, w) in enumerate(original_sizes):
+            # 1. Get scores and labels for the current image by filtering above a threshold
+            probs = logits[i].sigmoid()
+            keep = probs > 0.05
+            scores = probs[keep]
+            query_indices, labels = torch.where(keep)
     
-            # Post-processing remains the same for normalization and scaling
-            final_boxes = box_convert(final_boxes, in_fmt="cxcywh", out_fmt="xyxy")
-            scale_fct = torch.tensor([w, h, w, h], device=self.device)
-            final_boxes = final_boxes * scale_fct
-            
-            if final_masks.shape[0] > 0:
-                final_masks = F.interpolate(
-                    final_masks.unsqueeze(1), size=(h.item(), w.item()),
-                    mode="bilinear", align_corners=False
+            # 2. Get the corresponding boxes, convert to xyxy format, and scale to original image size
+            boxes = box_convert(boxes_norm[i][query_indices], in_fmt="cxcywh", out_fmt="xyxy")
+            boxes *= torch.tensor([w, h, w, h], device=boxes.device)
+    
+            # 3. Get the corresponding masks, resize, and binarize
+            masks = masks_logits[i][query_indices]
+            if masks.numel() > 0:
+                # Upsample masks to the original image size
+                masks = F.interpolate(
+                    masks.unsqueeze(1), size=(h.item(), w.item()), mode="bilinear", align_corners=False
                 ).squeeze(1)
-                final_masks = (final_masks > 0.5).to(torch.uint8)
+                # Convert mask logits to binary masks
+                masks = (masks.sigmoid() > 0.1).to(torch.uint8)
             else:
-                final_masks = torch.empty((0, h, w), device=self.device, dtype=torch.uint8)
-    
-            preds.append({
-                'scores': pred_scores, 
-                'labels': pred_labels,
-                'boxes': final_boxes, 
-                'masks': final_masks,
-            })
-        return preds
+                # Handle cases with no detections
+                masks = torch.empty((0, h, w), device=masks.device, dtype=torch.uint8)
+                
+            results.append({"scores": scores, "labels": labels, "boxes": boxes, "masks": masks})
+            
+        return results
         
     def _format_preds_detr(self, outputs, original_sizes):
         preds = []
