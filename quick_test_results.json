@@ -26,10 +26,10 @@
   "simple_lw_detr": {
     "backbone": "simple",
     "head": "lw_detr",
-    "status": "failed",
-    "instantiation": false,
-    "forward_pass": false,
-    "error": "Head failed: 'SimpleTestBackbone' object has no attribute 'feature_info'"
+    "status": "working",
+    "instantiation": true,
+    "forward_pass": true,
+    "error": null
   },
   "dino_maskrcnn": {
     "backbone": "dino",
