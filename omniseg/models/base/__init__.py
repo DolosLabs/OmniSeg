@@ -27,7 +27,7 @@ class BaseBackbone(ABC):
 class BaseHead(ABC):
     """Abstract base class for all segmentation heads."""
     
-    def __init__(self, num_classes: int, backbone_type: str = 'dino', image_size: int = 224):
+    def __init__(self, num_classes: int, backbone_type: str = 'dino', image_size: int = 224,**kwargs,):
         super().__init__()
         self.num_classes = num_classes
         self.backbone_type = backbone_type
