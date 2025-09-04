@@ -28,9 +28,14 @@ def main():
                         help="Choose the backbone model.")
     parser.add_argument('--head', type=str, choices=get_available_heads(), default='maskrcnn',
                         help="Choose the segmentation head.")
-    # MODIFIED: A single config argument to customize the chosen head.
     parser.add_argument('--head_config', type=str, default='{}',
                         help="JSON string with kwargs to override the head's default parameters, e.g., '{\"d_model\": 96, \"num_queries\": 30}'.")
+
+    # --- MODIFIED: Added --epochs argument ---
+    # The default value is taken from the config file but can be overridden from the command line.
+    parser.add_argument('--epochs', type=int, default=EPOCHS,
+                        help="Number of training epochs to run.")
+    # ----------------------------------------
 
     # All other arguments remain the same
     parser.add_argument('--learning_rate', type=float, default=5e-5, help="Learning rate for the optimizer.")
@@ -78,6 +83,7 @@ def main():
     if args.backbone == 'swin':
         swin_model_name = 'microsoft/swin-base-patch4-window7-224-in22k'
         try:
+            from transformers import AutoConfig
             config = AutoConfig.from_pretrained(swin_model_name)
             patch_size, window_size = config.patch_size, config.window_size
             divisor = patch_size * window_size
@@ -87,10 +93,11 @@ def main():
                 image_size = adjusted_size
         except Exception as e:
             print(f"Could not adjust image size for Swin: {e}")
-    print(f"\n--- Training Configuration ---")
+    
+    print(f"\n--- Model Configuration ---")
     print(f"Backbone: {args.backbone}")
     print(f"Head: {args.head}")
-
+    
     # Parse and print the head config
     try:
         head_config_overrides = json.loads(args.head_config)
@@ -101,8 +108,7 @@ def main():
         sys.exit(1)
 
     print(f"\n--- Training Configuration ---")
-    print(f"Backbone: {args.backbone}")
-    print(f"Head: {args.head}")
+    print(f"Epochs: {args.epochs}") # Print the number of epochs
     print(f"Image size: {image_size}")
     print(f"Batch size: {batch_size}")
     print(f"Learning rate: {args.learning_rate}")
@@ -120,54 +126,48 @@ def main():
     run_dir = os.path.join(PROJECT_DIR, 'runs', run_name)
     os.makedirs(run_dir, exist_ok=True)
     
-    # --- MODIFIED: Head and Backbone Initialization ---
+    # --- Head and Backbone Initialization ---
 
     # 1. Initialize Backbone
     backbone = get_backbone(args.backbone)
 
     # 2. Prepare all arguments for the Head
-    # Start with a base dictionary of arguments that heads might need
     head_kwargs = {
-        'in_channels': getattr(backbone, 'num_feature_channels', None), # For heads like MaskRCNN
-        'image_size': image_size,                                    # For heads like LW-DETR
-        'backbone_type': args.backbone                               # For context if needed
+        'in_channels': getattr(backbone, 'num_feature_channels', None),
+        'image_size': image_size,
+        'backbone_type': args.backbone
     }
-    # The user's overrides from the JSON string take precedence
     head_kwargs.update(head_config_overrides)
 
-    # 3. Initialize Head using your flexible get_head function
-    # The **head_kwargs unpacks the dictionary into keyword arguments
+    # 3. Initialize Head
     head = get_head(
         head_type=args.head,
         num_classes=num_classes,
         **head_kwargs
     )
-    # --- Add this code to print the head size ---
     head_params = sum(p.numel() for p in head.parameters() if p.requires_grad)
     print(f"✅ Head Size (Trainable Parameters): {head_params / 1e6:.2f} M")
-    # -------------------------------------------
-    # Initialize data module (remains the same)
+    
+    # Initialize data module
     coco_datamodule = COCODataModule(
         project_dir=PROJECT_DIR,
         batch_size=batch_size,
         image_size=image_size,
         num_workers=args.num_workers,
         num_labeled_images=args.num_labeled_images,
-        num_unlabeled_images=args.num_unlabeled_images
+        num_unlabeled_images=args.num_unlabeled_images,
     )
 
-    # 4. Initialize the Lightning Module by passing the created components
-    # ASSUMPTION: SSLSegmentationLightning __init__ is updated to accept these objects
+    # 4. Initialize the Lightning Module
     model = SSLSegmentationLightning(
         head=head,
-        head_type=args.head,         # Pass head_type for internal logic
-        image_size=image_size,       # Pass image_size for augmentations
+        head_type=args.head,
+        image_size=image_size,
         num_classes=num_classes,
         lr=args.learning_rate,
         warmup_steps=args.warmup_steps,
         unsup_rampup_steps=args.unsup_rampup_steps
     )
-
     
     checkpoint_callback = ModelCheckpoint(
         dirpath=run_dir, 
@@ -179,7 +179,6 @@ def main():
         save_last=True
     )
     
-    # NEW: Instantiate the EarlyStopping callback
     early_stopping_callback = EarlyStopping(
         monitor=args.early_stopping_monitor,
         patience=args.early_stopping_patience,
@@ -190,14 +189,15 @@ def main():
     strategy = "ddp_find_unused_parameters_true" if args.find_unused_parameters else "ddp"
 
     trainer = pl.Trainer(
-        max_epochs=EPOCHS,
+        # --- MODIFIED: Use the command-line argument for max_epochs ---
+        max_epochs=args.epochs,
+        # ------------------------------------------------------------
         max_steps=args.max_steps,
         accelerator="auto",
         devices="auto",
         strategy=strategy,
         accumulate_grad_batches=args.accumulate_grad_batches,
         check_val_every_n_epoch=args.val_every_n_epoch,
-        # MODIFIED: Add the early stopping callback to the list
         callbacks=[checkpoint_callback, early_stopping_callback],
         log_every_n_steps=10,
         precision=precision_setting,
