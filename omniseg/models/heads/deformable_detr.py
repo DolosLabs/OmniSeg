@@ -8,6 +8,7 @@ Deformable DETR paper. The class has been renamed to `DETRSegmentationHead` for 
 
 from collections import OrderedDict
 from typing import Dict, List, Optional
+import copy
 
 import torch
 import torch.nn as nn
@@ -259,9 +260,15 @@ class SetCriterion(nn.Module):
         return weighted_losses
 
 
+def _get_clones(module: nn.Module, N: int) -> nn.ModuleList:
+    """Helper function to clone a module N times."""
+    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
+
+
 class DETRSegmentationHead(BaseHead, nn.Module):
     """
-    A simplified DETR-style segmentation head with a standard Transformer decoder.
+    A DETR-style segmentation head with a standard Transformer decoder and optional
+    Group-DETR sequential decoding.
 
     This module combines a backbone with FPN, a Transformer decoder, and prediction
     heads for object detection and instance segmentation.
@@ -278,20 +285,31 @@ class DETRSegmentationHead(BaseHead, nn.Module):
         d_model: int = 256,
         num_queries: int = 100,
         num_decoder_layers: int = 6,
+        num_groups: int = 1, # Add this parameter
+        **kwargs,
     ):
         # Call initializers for both parent classes
-        BaseHead.__init__(self, num_classes, backbone_type, image_size)
+        BaseHead.__init__(self, num_classes, backbone_type, image_size, **kwargs)
         nn.Module.__init__(self)
 
         self.d_model = d_model
         self.num_queries = num_queries
-        
+        self.num_groups = num_groups # Store the number of groups
+
+        # Add an assertion to ensure queries can be split evenly
+        if self.num_groups > 1:
+            assert self.num_queries % self.num_groups == 0, \
+                f"num_queries ({self.num_queries}) must be divisible by num_groups ({self.num_groups})"
+
         self.backbone = GenericBackboneWithFPN(
             backbone_type, fpn_out_channels=d_model, dummy_input_size=image_size
         )
 
         self.query_embed = nn.Embedding(num_queries, d_model)
 
+        # --- REFACTORED DECODER ---
+        # Refactored from a single nn.TransformerDecoder to a ModuleList of layers
+        # to enable the group-wise decoding logic.
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,
             nhead=8,
@@ -299,8 +317,8 @@ class DETRSegmentationHead(BaseHead, nn.Module):
             dropout=0.1,
             batch_first=True,
         )
-        self.transformer_decoder = nn.TransformerDecoder(
-            decoder_layer, num_layers=num_decoder_layers
+        self.transformer_decoder = nn.ModuleList(
+            _get_clones(decoder_layer, num_decoder_layers)
         )
 
         # Prediction heads
@@ -311,13 +329,13 @@ class DETRSegmentationHead(BaseHead, nn.Module):
         self.mask_head = nn.Sequential(
             nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, d_model)
         )
-        
+
         self._init_criterion()
 
     def _init_criterion(self) -> None:
         """Initializes the loss criterion and matcher."""
         matcher = HungarianMatcher(cost_class=1.0, cost_bbox=5.0, cost_giou=2.0)
-        
+
         weight_dict = {
             "loss_ce": 1.0,
             "loss_bbox": 5.0,
@@ -326,6 +344,11 @@ class DETRSegmentationHead(BaseHead, nn.Module):
             "loss_dice": 1.0,
         }
         
+        # Add weights for auxiliary losses if they are ever used
+        for i in range(len(self.transformer_decoder) - 1):
+            weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
+
+
         self.criterion = SetCriterion(
             self.num_classes,
             matcher=matcher,
@@ -335,7 +358,7 @@ class DETRSegmentationHead(BaseHead, nn.Module):
 
     def forward(
         self, pixel_values: torch.Tensor, targets: Optional[List[Dict]] = None
-    ) -> Dict[str, torch.Tensor]:
+    ):
         """
         Forward pass for the DETR segmentation head.
 
@@ -349,26 +372,62 @@ class DETRSegmentationHead(BaseHead, nn.Module):
         """
         # 1. Get multi-scale features from backbone + FPN
         feature_maps = self.backbone(pixel_values)
-        
+
         # 2. Use the highest-resolution feature map as memory for the decoder
         finest_features = feature_maps['0']
         B, C, H_f, W_f = finest_features.shape
         memory = finest_features.flatten(2).transpose(1, 2)  # (B, H_f*W_f, C)
-        
+
         # 3. Prepare query embeddings
-        # OPTIMIZED: Use expand() for memory efficiency
         query_embeds = self.query_embed.weight.unsqueeze(0).expand(B, -1, -1)
 
-        # 4. Pass through the Transformer decoder
-        decoder_output = self.transformer_decoder(tgt=query_embeds, memory=memory)
-        
+        # 4. Pass through the Transformer decoder with optional group logic
+        decoder_output = query_embeds
+
+        # --- REPLACED DECODER LOGIC ---
+        if self.num_groups == 1:
+            # Original behavior: pass all queries through all layers sequentially
+            for layer in self.transformer_decoder:
+                decoder_output = layer(tgt=decoder_output, memory=memory)
+        else:
+            # Group-DETR behavior: sequential group decoding
+            group_size = self.num_queries // self.num_groups
+            all_group_outputs = []
+
+            # Iterate through each group
+            for i in range(self.num_groups):
+                start, end = i * group_size, (i + 1) * group_size
+                
+                # The queries for this group are a slice of the running `decoder_output` tensor
+                group_queries = decoder_output[:, start:end, :]
+
+                # Pass this single group through the entire stack of decoder layers
+                current_tgt = group_queries
+                for layer in self.transformer_decoder:
+                    current_tgt = layer(tgt=current_tgt, memory=memory)
+                
+                # Store the final refined output for this group
+                all_group_outputs.append(current_tgt)
+
+                # CRITICAL: Update the main decoder_output tensor in place.
+                # This allows self-attention in the next group's processing
+                # to see the refined results of the current group.
+                if i < self.num_groups - 1:
+                    decoder_output = torch.cat([
+                        decoder_output[:, :start, :], 
+                        current_tgt, 
+                        decoder_output[:, end:, :]
+                    ], dim=1).detach()
+
+            # Combine the final outputs from all groups
+            decoder_output = torch.cat(all_group_outputs, dim=1)
+
         # 5. Generate predictions from the decoder output
         logits = self.class_embed(decoder_output)
         pred_boxes = self.bbox_embed(decoder_output).sigmoid()
         mask_embeds = self.mask_head(decoder_output)
 
         # 6. Compute masks via dot product with finest features
-        # (B, N_queries, C) @ (B, C, H*W) -> (B, N_queries, H*W)
         pred_masks_lowres = (mask_embeds @ finest_features.view(B, C, -1)).view(B, -1, H_f, W_f)
 
         # 7. Upsample masks to the original image size
@@ -378,19 +437,15 @@ class DETRSegmentationHead(BaseHead, nn.Module):
             mode='bilinear',
             align_corners=False,
         )
-        
+
         outputs = {
             "pred_logits": logits,
             "pred_boxes": pred_boxes,
             "pred_masks": pred_masks,
         }
-        
-        # NOTE: This simplified model does not produce auxiliary outputs from
-        # intermediate decoder layers, but the criterion is set up to handle them
-        # if they were added.
-        
+
         if targets is not None:
             losses = self.criterion(outputs, targets)
             return outputs, losses
-            
+
         return outputs
