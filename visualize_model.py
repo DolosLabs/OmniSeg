@@ -4,6 +4,7 @@ import argparse
 import os
 import random
 import torch
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -15,17 +16,17 @@ from omniseg.data import COCODataModule, get_transforms
 from omniseg.training import SSLSegmentationLightning
 from omniseg.models.heads.contourformer import contours_to_masks
 
-# --- NEW: Import all possible head modules ---
+# --- Import all possible head modules ---
 from omniseg.models.heads.deformable_detr import DETRSegmentationHead
 from omniseg.models.heads.contourformer import ContourFormerHead
 from omniseg.models.heads.maskrcnn import MaskRCNNHead
-# Add any other head classes you might use here
+from omniseg.models.heads.lw_detr import LWDETRHead # Ensure this import path is correct
 
 # --- Constants ---
 CONFIDENCE_THRESHOLD = 0.5
 RANDOM_SEED = 42
 
-# --- NEW HELPER FUNCTION ---
+# --- HELPER FUNCTION ---
 def build_head_from_hparams(hparams: Dict[str, Any]) -> torch.nn.Module:
     """
     Instantiates the correct model head based on hyperparameters.
@@ -34,29 +35,39 @@ def build_head_from_hparams(hparams: Dict[str, Any]) -> torch.nn.Module:
     if not head_type:
         raise ValueError("Could not find 'head_type' in model hyperparameters.")
 
-    # You may need to add more parameters here if your head constructors require them
     num_classes = hparams.get('num_classes', 80)
     
     print(f"Building model head of type: '{head_type}'")
 
     if head_type == 'deformable_detr':
         # NOTE: Ensure these parameters match those used during training!
-        # They should be available in your training config files.
         return DETRSegmentationHead(
             num_classes=num_classes,
-            hidden_dim=256,              # From your "d_model"
-            num_queries=52,              # From your "num_queries"
-            dec_layers=4,                # From your "num_decoder_layers"
-            num_groups=13,               # From your "num_groups"
-
-            # --- VERIFY THESE REMAINING VALUES ---
-            # These were not in your config, so verify they match your training setup.
-            nheads=8,
-            dim_feedforward=2048,
-            enc_layers=6,
-            pre_norm=False,
-            enforce_input_project=False,
-            mask_classification=True
+            backbone_type=hparams.get('backbone_type', 'dino'),
+            hidden_dim=hparams.get('d_model', 256),
+            num_queries=hparams.get('num_queries', 52),
+            dec_layers=hparams.get('num_decoder_layers', 4),
+            num_groups=hparams.get('num_groups', 13),
+            nheads=hparams.get('n_heads', 8),
+            dim_feedforward=hparams.get('d_ffn', 2048),
+            enc_layers=6, # Default/legacy value
+            pre_norm=False, # Default/legacy value
+            enforce_input_project=False, # Default/legacy value
+            mask_classification=True # Default/legacy value
+        )
+    elif head_type == 'lw_detr':
+        # NOTE: Ensure these parameters match those used during training!
+        return LWDETRHead(
+            num_classes=num_classes,
+            backbone_type=hparams.get('backbone_type', 'dino'),
+            image_size=hparams.get('image_size', 64),
+            d_model=hparams.get('d_model', 256),
+            num_queries=hparams.get('num_queries', 52),
+            num_decoder_layers=hparams.get('num_decoder_layers', 4),
+            n_heads=hparams.get('n_heads', 8),
+            d_ffn=hparams.get('d_ffn', 1024),
+            mask_dim=hparams.get('mask_dim', 16),
+            num_groups=hparams.get('num_groups', 13)
         )
     elif head_type == 'contourformer':
         # NOTE: Adjust these parameters as needed
@@ -72,11 +83,10 @@ def build_head_from_hparams(hparams: Dict[str, Any]) -> torch.nn.Module:
             control_points=16
         )
     elif head_type == 'maskrcnn':
-         # NOTE: Adjust these parameters as needed
+        # NOTE: Adjust these parameters as needed
         return MaskRCNNHead(
             num_classes=num_classes
         )
-    # Add other head types here with an elif block
     else:
         raise NotImplementedError(f"Head type '{head_type}' is not supported by this script.")
 
@@ -92,7 +102,6 @@ def get_device() -> torch.device:
 def process_predictions(model_hparams: Dict[str, Any], raw_outputs: Any, original_size: Tuple[int, int]) -> Dict[str, np.ndarray]:
     """
     Processes raw model outputs into a standardized dictionary of numpy arrays.
-    (This function remains the same as before)
     """
     head_type = model_hparams.get('head_type', 'unknown')
 
@@ -145,7 +154,7 @@ def process_predictions(model_hparams: Dict[str, Any], raw_outputs: Any, origina
             print(f"Error processing ContourFormer outputs: {e}")
             return {"masks": np.array([]), "labels": np.array([]), "scores": np.array([])}
 
-    elif head_type == 'deformable_detr':
+    elif head_type in ['deformable_detr', 'lw_detr']: # MODIFIED: Handle both DETR types here
         try:
             if isinstance(raw_outputs, dict):
                 logits = raw_outputs.get("pred_logits")
@@ -155,13 +164,13 @@ def process_predictions(model_hparams: Dict[str, Any], raw_outputs: Any, origina
                     if logits.dim() == 3: logits = logits[0]
                     if masks.dim() == 4: masks = masks[0]
                     
+                    # For DETR, last class is "no object"
                     scores_softmax = logits.softmax(-1)[:, :-1]
                     scores, labels = scores_softmax.max(-1)
                     keep_mask = scores > CONFIDENCE_THRESHOLD
                     
                     selected_masks = masks[keep_mask]
                     if len(selected_masks) > 0:
-                        import torch.nn.functional as F
                         resized_masks = F.interpolate(
                             selected_masks.unsqueeze(0), 
                             size=original_size, 
@@ -177,9 +186,10 @@ def process_predictions(model_hparams: Dict[str, Any], raw_outputs: Any, origina
                         "labels": labels[keep_mask].detach().cpu().numpy(),
                         "scores": scores[keep_mask].detach().cpu().numpy()
                     }
+            print(f"⚠️ Unexpected {head_type} raw_outputs format")
             return {"masks": np.array([]), "labels": np.array([]), "scores": np.array([])}
         except Exception as e:
-            print(f"Error processing DETR outputs: {e}")
+            print(f"Error processing {head_type} outputs: {e}")
             return {"masks": np.array([]), "labels": np.array([]), "scores": np.array([])}
 
     else:
@@ -188,7 +198,6 @@ def process_predictions(model_hparams: Dict[str, Any], raw_outputs: Any, origina
 
 def create_mask_overlay(image: Image.Image, masks: np.ndarray, colors: np.ndarray) -> np.ndarray:
     """Creates a colored overlay from masks on top of an image."""
-    # (This function remains the same as before)
     if masks.ndim == 2:
         masks = masks[np.newaxis, ...]
         
@@ -199,14 +208,17 @@ def create_mask_overlay(image: Image.Image, masks: np.ndarray, colors: np.ndarra
         if isinstance(mask, torch.Tensor):
             mask = mask.detach().cpu().numpy()
 
-        mask_pil = Image.fromarray(((mask > 0.5).astype(np.uint8)) * 255)
-        resized_mask = np.array(mask_pil.resize(image.size)) > 0
+        # The mask should already be the correct size from process_predictions
+        resized_mask = (mask > 0.5)
         
         for c in range(3):
             combined_mask_color[resized_mask, c] = color[c]
             
     image_arr = np.array(image) / 255.0
-    overlay = 0.6 * image_arr + 0.4 * combined_mask_color
+    # Create overlay where there are masks
+    overlay_area = np.any(combined_mask_color > 0, axis=-1)
+    overlay = image_arr.copy()
+    overlay[overlay_area] = 0.6 * image_arr[overlay_area] + 0.4 * combined_mask_color[overlay_area]
     return np.clip(overlay, 0, 1)
 
 # --- Main Visualization Logic ---
@@ -256,12 +268,13 @@ def visualize_model(checkpoint_path: str, project_dir: str, num_images: int):
 
     for i, idx in enumerate(indices):
         image_pil, target = val_dataset[idx]
-        original_size = image_pil.size[::-1]
+        original_size = image_pil.size[::-1] # (height, width)
         
         image_tensor = val_transform(image_pil).unsqueeze(0).to(device)
         
         with torch.no_grad():
             model.to(device)
+            # Forward pass through the student model (backbone + head)
             raw_outputs = model.student(image_tensor)
             
             try:
@@ -298,9 +311,10 @@ def visualize_model(checkpoint_path: str, project_dir: str, num_images: int):
     
     backbone = model.hparams.get('backbone_type', 'unknown_backbone')
     head_name = model.hparams.get('head_type', 'unknown_head')
+    ckpt_name = os.path.splitext(os.path.basename(checkpoint_path))[0]
     image_prefix = f"{backbone}_{head_name}"
     
-    output_path = os.path.join(output_dir, f'{image_prefix}_predictions_{os.path.basename(checkpoint_path)}.png')
+    output_path = os.path.join(output_dir, f'{image_prefix}_predictions_{ckpt_name}.png')
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.show()
     
