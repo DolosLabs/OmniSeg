@@ -3,13 +3,13 @@ Lightweight DETR-style detection head based on LW-DETR.
 
 This module implements a DETR-style detection head inspired by the paper:
 "LW-DETR: A Transformer Replacement to YOLO for Real-Time Detection"
-(arXiv:2406.03459v1) [cite_start][cite: 2].
+(arXiv:2406.03459v1) .
 
 Features:
 - Flexible backbone wrapper: Supports ViT (including DINO) and CNN backbones.
-- [cite_start]Deformable-attention decoder, as used in LW-DETR[cite: 101].
+- Deformable-attention decoder, as used in LW-DETR.
 - Hungarian matcher and a loss set including the IoU-aware BCE loss (IA-BCE)
-  [cite_start]from the LW-DETR paper[cite: 121].
+  from the LW-DETR paper.
 - Minimal external dependencies: timm, scipy.
 - Preserves DINO-style single-stage query and box prediction logic.
 
@@ -63,13 +63,13 @@ except ImportError as e:
             self.n_points = n_points
             self.d_model = d_model
             self.head_dim = d_model // n_heads
-    
+        
             self.sampling_offsets = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
             self.attention_weights = nn.Linear(d_model, n_heads * n_levels * n_points)
             self.value_proj = nn.Linear(d_model, d_model)
             self.output_proj = nn.Linear(d_model, d_model)
             self._reset_parameters()
-    
+        
         def _reset_parameters(self):
             nn.init.constant_(self.sampling_offsets.weight, 0.0)
             nn.init.constant_(self.sampling_offsets.bias, 0.0)
@@ -79,7 +79,7 @@ except ImportError as e:
             nn.init.constant_(self.value_proj.bias, 0.0)
             nn.init.xavier_uniform_(self.output_proj.weight)
             nn.init.constant_(self.output_proj.bias, 0.0)
-    
+        
         def forward(
             self,
             query,
@@ -99,17 +99,17 @@ except ImportError as e:
             N, Lq, C = query.shape
             N2, L, C2 = input_flatten.shape
             assert N == N2 and C == C2, "Shape mismatch between query and input_flatten"
-    
+        
             # (N, L, n_heads, head_dim)
             value = self.value_proj(input_flatten).view(N, L, self.n_heads, self.head_dim)
-    
+        
             # (N, Lq, n_heads, n_levels, n_points, 2)
             offsets = self.sampling_offsets(query).view(N, Lq, self.n_heads, self.n_levels, self.n_points, 2)
-    
+        
             # (N, Lq, n_heads, n_levels, n_points)
             attention_weights = self.attention_weights(query).view(N, Lq, self.n_heads, self.n_levels, self.n_points)
             attention_weights = F.softmax(attention_weights, -1)
-    
+        
             # compute sampling locations
             if reference_points.shape[-1] == 2:
                 ref = reference_points.unsqueeze(2).unsqueeze(4)  # (N, Lq, 1, n_levels, 1, 2)
@@ -120,36 +120,36 @@ except ImportError as e:
                 ref_xy = reference_points[..., :2].unsqueeze(2).unsqueeze(3).unsqueeze(4)
                 ref_wh = reference_points[..., 2:].unsqueeze(2).unsqueeze(3).unsqueeze(4)
                 sampling_locations = ref_xy + offsets / self.n_points * ref_wh * 0.5
-    
+        
             # split per level
             splits = [H * W for H, W in input_spatial_shapes]
             value_list = value.split(splits, dim=1)
-    
+        
             sampling_grids = 2 * sampling_locations - 1
             sampled_value_list = []
-    
+        
             for lvl, (H, W) in enumerate(input_spatial_shapes):
                 v_l = value_list[lvl].transpose(1, 2).reshape(N * self.n_heads, self.head_dim, H, W)
                 grid_l = sampling_grids[:, :, :, lvl]  # (N, Lq, n_heads, n_points, 2)
                 grid_l = grid_l.permute(0, 2, 1, 3, 4).reshape(N * self.n_heads, Lq * self.n_points, 2)
                 grid_l = grid_l.unsqueeze(1)  # (N*heads, 1, Lq*n_points, 2)
-    
+        
                 sampled = F.grid_sample(
                     v_l, grid_l, mode="bilinear", padding_mode="zeros", align_corners=False
                 )  # (N*heads, head_dim, 1, Lq*n_points)
-    
+        
                 sampled = sampled.squeeze(2).reshape(N, self.n_heads, self.head_dim, Lq, self.n_points)
                 sampled_value_list.append(sampled)
-    
+        
             # (N, n_heads, head_dim, Lq, n_levels, n_points)
             sampled_values = torch.stack(sampled_value_list, dim=4)
-    
+        
             # (N, Lq, n_heads, n_levels, n_points) -> align with sampled_values
             attn = attention_weights.permute(0, 2, 3, 1, 4).unsqueeze(2)
             # (N, n_heads, head_dim, Lq, n_levels, n_points) * (N, n_heads, 1, Lq, n_levels, n_points)
             output = (sampled_values * attn).sum(-1).sum(4)  # sum over points and levels
             output = output.permute(0, 3, 1, 2).reshape(N, Lq, C)
-    
+        
             return self.output_proj(output)
 
     DeformableAttention = PurePyTorchDeformableAttention  # type: ignore
@@ -172,106 +172,49 @@ def _get_clones(module: nn.Module, N: int) -> nn.ModuleList:
 # --- Backbone wrapper ---
 
 
-class BackboneWithOptionalFPN(nn.Module):
+class GenericBackboneWithFPN(nn.Module):
     """
-    Flexible backbone wrapper.
-    - ViT-like (e.g., DINO, SAM): extracts patch tokens and uses a single projection layer.
-      NOTE: This is a simplification of the multi-level feature aggregation and C2f
-      [cite_start]projector described in the LW-DETR paper[cite: 98, 119].
-    - CNN backbone: processes multi-scale features with a Feature Pyramid Network (FPN).
+    A generic wrapper to add a Feature Pyramid Network (FPN) to a backbone.
+
+    This module automatically discovers the output feature channels of the provided
+    backbone and connects them to an FPN to generate a multi-scale feature pyramid.
     """
 
-    def __init__(self, backbone_type: str, out_channels: int, image_size: int, fpn_feature_indices=(1, 2, 3)):
+    def __init__(
+        self, backbone_type: str = 'dino', fpn_out_channels: int = 256, dummy_input_size: int = 224
+    ):
         super().__init__()
-        self.backbone_type = backbone_type.lower()
-        self.is_vit = "sam" in self.backbone_type or "dino" in self.backbone_type or "vit" in self.backbone_type
-        self.out_channels = out_channels
-        self.image_size = image_size
-
         self.backbone = get_backbone(backbone_type)
+        self.out_channels = fpn_out_channels
 
-        if self.is_vit:
-            # Determine embedding dim
-            if hasattr(self.backbone, "embed_dim"):
-                self.embed_dim = self.backbone.embed_dim
-            elif hasattr(self.backbone, "dino"): # DINO-specific handling
-                self.embed_dim = self.backbone.dino.embeddings.patch_embeddings.out_channels
-            else:
-                raise AttributeError(f"Cannot determine embed_dim for {type(self.backbone).__name__}")
+        # Discover output channels by running a dummy forward pass
+        dummy_input = torch.randn(1, 3, dummy_input_size, dummy_input_size)
+        with torch.no_grad():
+            feat_dict = self.backbone(dummy_input)
 
-            # Determine patch size
-            if hasattr(self.backbone, "patch_embed"):
-                self.patch_size = self.backbone.patch_embed.patch_size[0]
-            elif hasattr(self.backbone, "conv_proj"):
-                # some timm models use conv_proj
-                self.patch_size = self.backbone.conv_proj.kernel_size[0]
-            elif hasattr(self.backbone, "dino"): # DINO-specific handling
-                self.patch_size = self.backbone.dino.embeddings.patch_embeddings.kernel_size[0]
-            else:
-                raise AttributeError(f"Cannot determine patch size for {type(self.backbone).__name__}")
+        # Ensure features are sorted to maintain consistent order for the FPN
+        self._feature_keys = sorted(feat_dict.keys())
+        in_channels_list = [feat_dict[k].shape[1] for k in self._feature_keys]
 
-            self.grid_size = self.image_size // self.patch_size
-            self.fpn = None
-            self.proj = nn.Conv2d(self.embed_dim, out_channels, kernel_size=1)
-        else:
-            # CNN + FPN path
-            feature_info = self.backbone.feature_info.channels()
-            self.proj = None
-            self.fpn = FeaturePyramidNetwork(in_channels_list=feature_info, out_channels=out_channels)
+        self.fpn = FeaturePyramidNetwork(
+            in_channels_list=in_channels_list, out_channels=self.out_channels
+        )
 
     @property
     def num_feature_levels(self) -> int:
-        return 1 if self.is_vit else len(self.backbone.feature_info)
+        return len(self._feature_keys)
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        if self.is_vit:
-            # ViT forward (support models with forward_features or plain forward)
-            model_output = self.backbone.forward_features(x) if hasattr(self.backbone, "forward_features") else self.backbone(x)
-
-            # Extract a tensor robustly from various possible return types
-            features_tensor = None
-            if torch.is_tensor(model_output):
-                features_tensor = model_output
-            elif isinstance(model_output, dict):
-                for key in ("last_hidden_state", "hidden_states", "features", "res5"):
-                    if key in model_output:
-                        features_tensor = model_output[key] if key != "hidden_states" else model_output["hidden_states"][-1]
-                        break
-                if features_tensor is None:
-                    raise KeyError(f"Backbone output dict missing known keys. Available: {list(model_output.keys())}")
-            elif isinstance(model_output, (list, tuple)):
-                features_tensor = model_output[0]
-            else:
-                raise TypeError(f"Unsupported backbone output type: {type(model_output)}")
-
-            if features_tensor.ndim == 3:
-                # patch tokens: [B, N, C]
-                B, N, C = features_tensor.shape
-                num_prefix = getattr(self.backbone, "num_prefix_tokens", 1)
-                patch_tokens = features_tensor[:, num_prefix:, :]
-                h = w = self.grid_size
-                if patch_tokens.shape[1] != h * w:
-                    raise ValueError(f"Patch token count ({patch_tokens.shape[1]}) != grid ({h*w})")
-                feature_map = patch_tokens.transpose(1, 2).reshape(B, C, h, w)
-            elif features_tensor.ndim == 4:
-                # feature map: [B, C, H, W]
-                B, C, H, W = features_tensor.shape
-                if (H, W) == (1, 1):
-                    h = w = self.grid_size
-                    feature_map = F.interpolate(features_tensor, size=(h, w), mode="bilinear", align_corners=False)
-                else:
-                    feature_map = features_tensor
-            else:
-                raise TypeError(f"Unsupported feature tensor shape: {features_tensor.shape}")
-
-            projected = self.proj(feature_map)
-            return OrderedDict([("0", projected)])
-        else:
-            # CNN + FPN
-            features = self.backbone(x)
-            ordered = OrderedDict((str(i), feat) for i, feat in enumerate(features))
-            fpn_out = self.fpn(ordered)
-            return fpn_out
+        """Extracts features and processes them through the FPN."""
+        features = self.backbone(x)
+        
+        # Create an ordered dictionary of features for the FPN
+        ordered_features = OrderedDict((k, features[k]) for k in self._feature_keys)
+        
+        fpn_output = self.fpn(ordered_features)
+        
+        # Remap keys to strings '0', '1', '2', etc., for DETR compatibility
+        return OrderedDict(zip(map(str, range(len(fpn_output))), fpn_output.values()))
 
 
 # --- Decoder layer ---
@@ -369,7 +312,7 @@ class HungarianMatcher(nn.Module):
 
 
 def ia_bce_loss(pred_scores: torch.Tensor, target_classes: torch.Tensor, target_ious: torch.Tensor, alpha: float = 0.25) -> torch.Tensor:
-    """Implements the IoU-aware BCE loss from the LW-DETR paper[cite: 121, 122, 125]."""
+    """Implements the IoU-aware BCE loss from the LW-DETR paper."""
     pred_prob = pred_scores.sigmoid()
     target_t = torch.zeros_like(pred_prob)
 
@@ -493,7 +436,10 @@ class LWDETRHead(BaseHead, nn.Module):
             assert self.num_queries % self.num_groups == 0, \
                 f"num_queries ({self.num_queries}) must be divisible by num_groups ({self.num_groups})"
 
-        self.backbone = BackboneWithOptionalFPN(backbone_type, out_channels=d_model, image_size=image_size)
+        # UPDATED LINE: Instantiates the new backbone class
+        self.backbone = GenericBackboneWithFPN(
+            backbone_type=backbone_type, fpn_out_channels=d_model, dummy_input_size=image_size
+        )
         self.num_feature_levels = self.backbone.num_feature_levels
 
         self.query_embed = nn.Embedding(num_queries, d_model)
@@ -582,11 +528,11 @@ class LWDETRHead(BaseHead, nn.Module):
                 # This allows the self-attention in the next group's processing
                 # to see the refined results of the current group.
                 if i < self.num_groups - 1:
-                     decoder_output = torch.cat([
-                        decoder_output[:, :start, :], 
-                        current_tgt, 
-                        decoder_output[:, end:, :]
-                    ], dim=1).detach() # Detach to prevent re-computing gradients
+                        decoder_output = torch.cat([
+                            decoder_output[:, :start, :], 
+                            current_tgt, 
+                            decoder_output[:, end:, :]
+                        ], dim=1).detach() # Detach to prevent re-computing gradients
 
             # Combine the final outputs from all groups
             decoder_output = torch.cat(all_group_outputs, dim=1)
