@@ -42,7 +42,8 @@ class SSLSegmentationLightning(pl.LightningModule):
                  ema_decay: float = 0.999,
                  warmup_steps: int = 500,
                  unsup_rampup_steps: int = 5000,
-                 unsup_weight: float = 1.0):
+                 unsup_weight: float = 1.0
+                ):
         super().__init__()
         # We explicitly save hyperparameters. The 'head' module itself is not saved as a hyperparameter.
         self.save_hyperparameters('head_type', 'image_size', 'num_classes', 'lr', 'ema_decay', 'warmup_steps', 'unsup_rampup_steps', 'unsup_weight')
@@ -126,9 +127,7 @@ class SSLSegmentationLightning(pl.LightningModule):
         
         with torch.no_grad():
             outputs = self.student(pixel_values)
-
-        targets_formatted = self._format_targets_for_metric(targets)
-        
+        targets_formatted = self._format_targets_for_metric(targets)      
         preds = []
         original_sizes = torch.tensor([img.size[::-1] for img in images], device=self.device)
         if self.hparams.head_type == 'maskrcnn':
