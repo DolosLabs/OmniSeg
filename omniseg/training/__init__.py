@@ -10,12 +10,10 @@ from torchvision.ops import box_convert
 from torchmetrics.detection import MeanAveragePrecision
 
 from ..data import get_transforms
-# REMOVED: get_head is no longer needed here
 from ..models.heads.contourformer import masks_to_contours, contours_to_masks
 
 
 def masks_to_boxes(masks: torch.Tensor) -> torch.Tensor:
-    # ... (function remains the same)
     if masks.numel() == 0:
         return torch.zeros((0, 4), dtype=torch.float32, device=masks.device)
     n = masks.shape[0]
@@ -32,7 +30,6 @@ def masks_to_boxes(masks: torch.Tensor) -> torch.Tensor:
 class SSLSegmentationLightning(pl.LightningModule):
     """Semi-supervised segmentation training with PyTorch Lightning."""
 
-    # --- MODIFIED __init__ SIGNATURE AND BODY ---
     def __init__(self,
                  head: nn.Module,
                  head_type: str,
@@ -45,15 +42,10 @@ class SSLSegmentationLightning(pl.LightningModule):
                  unsup_weight: float = 1.0
                 ):
         super().__init__()
-        # We explicitly save hyperparameters. The 'head' module itself is not saved as a hyperparameter.
         self.save_hyperparameters('head_type', 'image_size', 'num_classes', 'lr', 'ema_decay', 'warmup_steps', 'unsup_rampup_steps', 'unsup_weight')
 
-        # ADDED: The student model is now the head object passed in directly.
         self.student = head
         
-        # REMOVED: All internal get_head logic.
-
-        # The rest of the initialization remains the same.
         self.teacher = copy.deepcopy(self.student)
         for p in self.teacher.parameters():
             p.requires_grad = False
@@ -64,7 +56,6 @@ class SSLSegmentationLightning(pl.LightningModule):
         
         self.val_map = MeanAveragePrecision(box_format='xyxy', iou_type='segm')
 
-    # ... (all other methods of the class remain exactly the same)
     def configure_optimizers(self):
         return torch.optim.AdamW([p for p in self.student.parameters() if p.requires_grad], lr=self.hparams.lr)
 
@@ -83,10 +74,9 @@ class SSLSegmentationLightning(pl.LightningModule):
         self._update_teacher()
 
     def training_step(self, batch, batch_idx):
-        # ... (method remains the same)
         images_l, targets_l = batch["labeled"]
         pixel_values_l = torch.stack([self.train_aug(img, None)[0] for img in images_l]).to(device=self.device, dtype=self.dtype)
-        
+        batch_size = pixel_values_l.size(0)
         sup_loss = 0.0
         if self.hparams.head_type == 'maskrcnn':
             sup_loss = self._get_sup_loss_mrcnn(pixel_values_l, targets_l)
@@ -116,17 +106,39 @@ class SSLSegmentationLightning(pl.LightningModule):
         self.log_dict({
             "train_loss": total_loss, "sup_loss": sup_loss, "unsup_loss": unsup_loss,
             "unsup_weight": consistency_weight,
-        }, on_step=True, on_epoch=True, prog_bar=True)
+        }, on_step=True, on_epoch=True, prog_bar=True,sync_dist=True,batch_size=batch_size)
         
         return total_loss
         
     def validation_step(self, batch: Tuple[torch.Tensor, List[Dict]], batch_idx: int):
-        # ... (method remains the same)
         images, targets = batch
         pixel_values = torch.stack([self.val_aug(img, None)[0] for img in images]).to(device=self.device, dtype=self.dtype)
+        batch_size = pixel_values.size(0)
+        # --- MODIFIED SECTION START ---
+        # Calculate and log validation loss
+        # Temporarily switch to train mode to get the loss dictionary.
+        # The model's parameters are not updated because we are not calling optimizer.step().
+        self.student.train()
+        val_loss = 0.0
+        if self.hparams.head_type == 'maskrcnn':
+            val_loss = self._get_sup_loss_mrcnn(pixel_values, targets)
+        elif self.hparams.head_type in ['contourformer', 'deformable_detr', 'lw_detr']:
+            val_loss = self._get_sup_loss_detr_style(pixel_values, targets)
         
-        with torch.no_grad():
-            outputs = self.student(pixel_values)
+        # Switch back to eval mode for inference.
+        self.student.eval() 
+        
+        # log once per epoch (shows in progress bar/metrics)
+        self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        
+        # print per batch (rank 0 to avoid DDP spam)
+        if (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
+            print(f"[val][batch {batch_idx}] val_loss: {val_loss.item():.4f}")
+
+        # Calculate predictions for mAP metric.
+        # PyTorch Lightning handles the @torch.no_grad() context for validation steps.
+        outputs = self.student(pixel_values)
+        
         targets_formatted = self._format_targets_for_metric(targets)      
         preds = []
         original_sizes = torch.tensor([img.size[::-1] for img in images], device=self.device)
@@ -142,7 +154,6 @@ class SSLSegmentationLightning(pl.LightningModule):
         self.val_map.update(preds, targets_formatted)
 
     def on_validation_epoch_end(self):
-        # ... (method remains the same)
         map_dict = self.val_map.compute()
         val_mAP = map_dict['map'].to(self.device)
         val_mAP_50 = map_dict['map_50'].to(self.device)
@@ -155,7 +166,6 @@ class SSLSegmentationLightning(pl.LightningModule):
         self.val_map.reset()
 
     def _format_targets_for_metric(self, targets):
-        # ... (method remains the same)
         targets_formatted = []
         for target in targets:
             masks = target['masks'].to(self.device)
@@ -166,7 +176,6 @@ class SSLSegmentationLightning(pl.LightningModule):
         return targets_formatted
 
     def _format_preds_mrcnn(self, outputs):
-        # ... (method remains the same)
         preds = []
         for pred in outputs:
             pred['masks'] = (pred['masks'] > 0.5).squeeze(1).to(torch.uint8)
@@ -174,7 +183,6 @@ class SSLSegmentationLightning(pl.LightningModule):
         return preds
         
     def _format_preds_lw_detr(self, outputs, original_sizes):
-        # ... (method remains the same)
         logits, boxes_norm, masks_logits = outputs["pred_logits"], outputs["pred_boxes"], outputs["pred_masks"]
         results = []
         for i, (h, w) in enumerate(original_sizes):
@@ -194,7 +202,6 @@ class SSLSegmentationLightning(pl.LightningModule):
         return results
         
     def _format_preds_detr(self, outputs, original_sizes):
-        # ... (method remains the same)
         preds = []
         for i in range(outputs['pred_logits'].shape[0]):
             h, w = original_sizes[i]
@@ -210,7 +217,6 @@ class SSLSegmentationLightning(pl.LightningModule):
         return preds
         
     def _format_preds_cf(self, outputs, original_sizes):
-        # ... (method remains the same)
         preds = []
         for i in range(outputs['pred_logits'].shape[0]):
             h, w = original_sizes[i]
@@ -227,7 +233,6 @@ class SSLSegmentationLightning(pl.LightningModule):
         return preds
 
     def _get_sup_loss_detr_style(self, pixel_values, targets):
-        # ... (simplified helper for DETR-like models)
         targets_detr = []
         h, w = self.hparams.image_size, self.hparams.image_size
         for target in targets:
@@ -243,7 +248,6 @@ class SSLSegmentationLightning(pl.LightningModule):
         return sum(losses_sup.values())
 
     def _get_sup_loss_mrcnn(self, pixel_values, targets):
-        # ... (method remains the same)
         targets_mrcnn = []
         for target in targets:
             targets_mrcnn.append({
