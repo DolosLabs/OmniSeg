@@ -120,9 +120,11 @@ except ImportError as e:
                 sampled = sampled.squeeze(2).reshape(N, self.n_heads, self.head_dim, Lq, self.n_points)
                 sampled_value_list.append(sampled)
             
-            sampled_values = torch.stack(sampled_value_list, dim=4)
-            attn = attention_weights.permute(0, 2, 3, 1, 4).unsqueeze(2)
-            output = (sampled_values * attn).sum(-1).sum(4)
+            sampled_values = torch.stack(sampled_value_list, dim=4)  # (N, n_heads, head_dim, Lq, n_levels, n_points)
+            attn = attention_weights.permute(0, 2, 1, 3, 4)  # (N, n_heads, Lq, n_levels, n_points)
+            attn = attn.unsqueeze(2)  # (N, n_heads, 1, Lq, n_levels, n_points)
+            # Broadcast multiplication and sum over n_points and n_levels
+            output = (sampled_values * attn).sum(-1).sum(-1)  # Sum over n_points then n_levels
             output = output.permute(0, 3, 1, 2).reshape(N, Lq, C)
             return self.output_proj(output)
 
@@ -349,19 +351,28 @@ def ia_bce_loss(pred_scores: torch.Tensor, target_classes: torch.Tensor, target_
 
 
 def dice_loss(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Compute Dice loss for masks (improved version matching deformable_detr)."""
     inputs = inputs.sigmoid().flatten(1)
     targets = targets.flatten(1)
     numerator = 2 * (inputs * targets).sum(1)
     denominator = inputs.sum(-1) + targets.sum(-1)
-    return (1 - (numerator + 1) / (denominator + 1)).mean()
+    # Add small epsilon for numerical stability and handle empty case
+    loss = 1 - (numerator + 1e-5) / (denominator + 1e-5)
+    return loss.mean()
 
 
 class SetCriterion(nn.Module):
-    def __init__(self, num_classes: int, matcher: nn.Module, weight_dict: Dict[str, float]):
+    def __init__(self, num_classes: int, matcher: nn.Module, weight_dict: Dict[str, float], eos_coef: float = 0.1):
         super().__init__()
         self.num_classes = num_classes
         self.matcher = matcher
         self.weight_dict = weight_dict
+        self.eos_coef = eos_coef
+        
+        # Weight for the "no object" class in classification loss (like deformable_detr)
+        empty_weight = torch.ones(self.num_classes + 1)
+        empty_weight[-1] = self.eos_coef
+        self.register_buffer("empty_weight", empty_weight)
 
     @staticmethod
     def _get_permutation_idx(indices):
@@ -369,43 +380,89 @@ class SetCriterion(nn.Module):
         src_idx = torch.cat([src for (src, _) in indices])
         return batch_idx, src_idx
 
-    def forward(self, outputs, targets):
-        indices = self.matcher(outputs, targets)
-        num_objects = sum(len(t["labels"]) for t in targets)
-        num_objects = torch.as_tensor([num_objects], dtype=torch.float, device=next(iter(outputs.values())).device).clamp(min=1).item()
-
-        B, Q, _ = outputs["pred_logits"].shape
-        device = outputs["pred_logits"].device
-
-        target_classes = torch.full((B, Q), -1, dtype=torch.long, device=device)
-        target_ious = torch.zeros((B, Q), device=device)
-
-        for i, (src_idx, tgt_idx) in enumerate(indices):
-            target_classes[i, src_idx] = targets[i]["labels"][tgt_idx]
-            ious = generalized_box_iou(
-                box_convert(outputs["pred_boxes"][i, src_idx], "cxcywh", "xyxy"),
-                box_convert(targets[i]["boxes"][tgt_idx], "cxcywh", "xyxy"),
-            ).diag()
-            target_ious[i, src_idx] = ious
-
-        losses = {"loss_cls": ia_bce_loss(outputs["pred_logits"], target_classes, target_ious)}
-
+    def loss_labels(self, outputs, targets, indices, num_objects):
+        """Classification loss using standard cross-entropy (like deformable_detr) instead of IoU-aware BCE."""
+        src_logits = outputs['pred_logits']
         idx = self._get_permutation_idx(indices)
-        src_boxes = outputs["pred_boxes"][idx]
-        target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device)
+        target_classes[idx] = target_classes_o
+        
+        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
+        return {"loss_cls": loss_ce}
 
-        losses["loss_bbox"] = F.l1_loss(src_boxes, target_boxes, reduction="none").sum() / num_objects
-        giou_vals = generalized_box_iou(box_convert(src_boxes, "cxcywh", "xyxy"), box_convert(target_boxes, "cxcywh", "xyxy"))
-        losses["loss_giou"] = (1 - torch.diag(giou_vals)).sum() / num_objects
+    def loss_boxes(self, outputs, targets, indices, num_objects):
+        """Bounding box losses (same as deformable_detr)."""
+        idx = self._get_permutation_idx(indices)
+        src_boxes = outputs['pred_boxes'][idx]
+        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+        
+        src_boxes_xyxy = box_convert(src_boxes, in_fmt="cxcywh", out_fmt="xyxy")
+        target_boxes_xyxy = box_convert(target_boxes, in_fmt="cxcywh", out_fmt="xyxy")
+        loss_giou = 1 - torch.diag(generalized_box_iou(src_boxes_xyxy, target_boxes_xyxy))
 
-        if "pred_masks" in outputs and "masks" in targets[0] and idx[0].numel() > 0:
-            src_masks = outputs["pred_masks"][idx]
-            target_masks = torch.cat([t["masks"][i] for t, (_, i) in zip(targets, indices)], dim=0)
-            target_masks_resized = F.interpolate(target_masks.unsqueeze(1), size=src_masks.shape[-2:], mode="bilinear", align_corners=False).squeeze(1)
-            losses["loss_mask"] = F.binary_cross_entropy_with_logits(src_masks, target_masks_resized.float(), reduction="mean")
-            losses["loss_dice"] = dice_loss(src_masks, target_masks_resized.float())
+        return {
+            "loss_bbox": loss_bbox.sum() / num_objects,
+            "loss_giou": loss_giou.sum() / num_objects
+        }
 
-        return {k: v * self.weight_dict[k] for k, v in losses.items() if k in self.weight_dict}
+    def loss_masks(self, outputs, targets, indices, num_objects):
+        """Mask losses (same as deformable_detr)."""
+        if "pred_masks" not in outputs or "masks" not in targets[0]:
+            return {"loss_mask": torch.tensor(0.0, device=next(iter(outputs.values())).device),
+                    "loss_dice": torch.tensor(0.0, device=next(iter(outputs.values())).device)}
+            
+        src_idx = self._get_permutation_idx(indices)
+        src_masks = outputs["pred_masks"][src_idx]
+        
+        target_masks = torch.cat([t['masks'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        
+        # Resize target masks to match predicted mask size
+        target_masks_resized = F.interpolate(
+            target_masks.unsqueeze(1), 
+            size=src_masks.shape[-2:], 
+            mode="bilinear", 
+            align_corners=False
+        ).squeeze(1)
+        
+        # Use float() for BCE and Dice compatibility
+        target_masks_resized = target_masks_resized.to(src_masks.dtype)
+        
+        # BCE loss
+        loss_mask = F.binary_cross_entropy_with_logits(src_masks, target_masks_resized, reduction='none')
+        loss_mask = loss_mask.mean(dim=(1, 2))  # Average over pixels
+
+        # Dice loss
+        loss_dice = dice_loss(src_masks, target_masks_resized)
+        
+        return {
+            "loss_mask": loss_mask.sum() / num_objects,
+            "loss_dice": loss_dice
+        }
+
+    def forward(self, outputs, targets):
+        """Compute losses (following deformable_detr pattern)."""
+        outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+        indices = self.matcher(outputs_without_aux, targets)
+
+        # Sum objects across all GPUs for consistent normalization
+        num_objects = sum(len(t["labels"]) for t in targets)
+        num_objects_tensor = torch.as_tensor(
+            [num_objects], dtype=torch.float, device=next(iter(outputs.values())).device
+        )
+        num_objects = torch.clamp(num_objects_tensor, min=1).item()
+
+        losses = {}
+        for loss_fn_name in ['labels', 'boxes', 'masks']:
+            loss_map = getattr(self, f"loss_{loss_fn_name}")(outputs, targets, indices, num_objects)
+            losses.update(loss_map)
+                    
+        # Apply final weights
+        weighted_losses = {k: v * self.weight_dict[k] for k, v in losses.items() if k in self.weight_dict}
+        return weighted_losses
 
 
 # --- Main DETR head ---
@@ -452,7 +509,7 @@ class LWDETRHead(BaseHead, nn.Module):
         self.transformer_decoder = nn.ModuleList(_get_clones(decoder_layer, num_decoder_layers))
 
         # Prediction heads
-        self.class_embed = nn.Linear(d_model, num_classes)
+        self.class_embed = nn.Linear(d_model, num_classes + 1)  # +1 for background class (like deformable_detr)
         self.bbox_embed = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, 4))
         self.iou_head = nn.Sequential(nn.Linear(d_model, d_model // 2), nn.ReLU(), nn.Linear(d_model // 2, 1))
         self.query_scale = nn.Linear(d_model, 4)
@@ -462,9 +519,13 @@ class LWDETRHead(BaseHead, nn.Module):
         self._init_criterion()
 
     def _init_criterion(self):
-        matcher = HungarianMatcher()
-        weight_dict = {"loss_cls": 2.0, "loss_bbox": 6.0, "loss_giou": 3.0, "loss_mask": 2.0, "loss_dice": 2.0}
-        self.criterion = SetCriterion(self.num_classes, matcher=matcher, weight_dict=weight_dict)
+        # Align with deformable_detr for better convergence
+        matcher = HungarianMatcher(cost_class=1.0, cost_bbox=5.0, cost_giou=2.0)  # Reduced cost_class from 2.0 to 1.0
+        
+        # Align loss weights with deformable_detr for better convergence
+        weight_dict = {"loss_cls": 1.0, "loss_bbox": 5.0, "loss_giou": 2.0, "loss_mask": 1.0, "loss_dice": 1.0}
+        
+        self.criterion = SetCriterion(self.num_classes, matcher=matcher, weight_dict=weight_dict, eos_coef=0.1)
 
     def forward(self, pixel_values: torch.Tensor, targets: Optional[List[Dict]] = None):
         device = pixel_values.device
