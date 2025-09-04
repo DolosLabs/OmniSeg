@@ -361,83 +361,118 @@ class DETRSegmentationHead(BaseHead, nn.Module):
     ):
         """
         Forward pass for the DETR segmentation head.
-    
-        Implements parallel Group-DETR:
-          - During training: split queries into `num_groups` groups, run each group's
-            queries independently through the SAME decoder stack (weight-sharing),
-            concat group outputs and supervise all of them.
-          - During inference: only the first (primary) group's output is used.
+
+        Args:
+            pixel_values: Input images, shape (B, 3, H, W).
+            targets: Optional list of ground truth dicts for training.
+
+        Returns:
+            If targets are None, a dict of predictions.
+            If targets are provided, a tuple of (predictions, losses).
         """
         # 1. Get multi-scale features from backbone + FPN
         feature_maps = self.backbone(pixel_values)
-    
+
         # 2. Use the highest-resolution feature map as memory for the decoder
-        finest_features = feature_maps["0"]
+        finest_features = feature_maps['0']
         B, C, H_f, W_f = finest_features.shape
         memory = finest_features.flatten(2).transpose(1, 2)  # (B, H_f*W_f, C)
-    
+
         # 3. Prepare query embeddings
-        query_embeds = self.query_embed.weight.unsqueeze(0).expand(B, -1, -1)  # (B, Q, D)
-    
-        # 4. Pass through the Transformer decoder with parallel group logic
+        query_embeds = self.query_embed.weight.unsqueeze(0).expand(B, -1, -1)
+
+        # 4. Pass through the Transformer decoder with optional group logic
+        decoder_output = query_embeds
+
+        # --- REPLACED DECODER LOGIC ---
         if self.num_groups == 1:
-            # Single-group: standard decoding for all queries
-            decoder_output = query_embeds
+            # Original behavior: pass all queries through all layers sequentially
             for layer in self.transformer_decoder:
                 decoder_output = layer(tgt=decoder_output, memory=memory)
         else:
-            # Parallel Group-DETR: run each group's queries independently through the
-            # same decoder stack (weight-sharing).
+            # Group-DETR behavior: sequential group decoding
             group_size = self.num_queries // self.num_groups
-            group_outputs: List[torch.Tensor] = []
-    
+            all_group_outputs = []
+
+            # Iterate through each group
             for i in range(self.num_groups):
                 start, end = i * group_size, (i + 1) * group_size
-                group_queries = query_embeds[:, start:end, :]  # (B, group_size, D)
-    
+                
+                # The queries for this group are a slice of the running `decoder_output` tensor
+                group_queries = decoder_output[:, start:end, :]
+
+                # Pass this single group through the entire stack of decoder layers
                 current_tgt = group_queries
-                # Run full decoder stack (weights shared)
                 for layer in self.transformer_decoder:
                     current_tgt = layer(tgt=current_tgt, memory=memory)
-    
-                group_outputs.append(current_tgt)  # each current_tgt: (B, group_size, D)
-    
-            # Training: concatenate all group outputs for supervision
-            decoder_output = torch.cat(group_outputs, dim=1)  # (B, Q, D)
-    
-            # Inference: use only the primary group's output
-            if not self.training:
-                decoder_output = group_outputs[0]  # (B, group_size, D) usually group_size == Q
-    
+                
+                # Store the final refined output for this group
+                all_group_outputs.append(current_tgt)
+
+                # CRITICAL: Update the main decoder_output tensor in place.
+                # This allows self-attention in the next group's processing
+                # to see the refined results of the current group.
+                if i < self.num_groups - 1:
+                    decoder_output = torch.cat([
+                        decoder_output[:, :start, :], 
+                        current_tgt, 
+                        decoder_output[:, end:, :]
+                    ], dim=1).detach()
+
+            # Combine the final outputs from all groups
+            decoder_output = torch.cat(all_group_outputs, dim=1)    group_size = self.num_queries // self.num_groups
+    group_outputs = []
+
+    # Each group gets its own slice of queries and reference points
+    for i in range(self.num_groups):
+        start, end = i * group_size, (i + 1) * group_size
+        group_queries = query_embeds[:, start:end, :]
+        group_ref_points = reference_points[:, start:end, :]
+
+        # Run through the SAME decoder stack (weights shared across groups)
+        current_tgt = group_queries
+        for layer in self.transformer_decoder:
+            current_tgt = layer(
+                tgt=current_tgt,
+                memory=memory,
+                ref_points_c=group_ref_points,
+                memory_spatial_shapes=memory_spatial_shapes,
+                level_start_index=level_start_index,
+            )
+
+        group_outputs.append(current_tgt)
+
+    # Training: use outputs from all groups for supervision
+    decoder_output = torch.cat(group_outputs, dim=1)
+
+    # Inference: keep only the primary group (first one)
+    if not self.training:
+        decoder_output = group_outputs[0]
+
         # 5. Generate predictions from the decoder output
-        logits = self.class_embed(decoder_output)  # (B, Q, C+1)
-        pred_boxes = self.bbox_embed(decoder_output).sigmoid()  # (B, Q, 4)
-        mask_embeds = self.mask_head(decoder_output)  # (B, Q, D)
-    
+        logits = self.class_embed(decoder_output)
+        pred_boxes = self.bbox_embed(decoder_output).sigmoid()
+        mask_embeds = self.mask_head(decoder_output)
+
         # 6. Compute masks via dot product with finest features
-        # finest_features_flat: (B, C, Hf*Wf) where C == d_model
-        finest_features_flat = finest_features.view(B, C, -1)  # (B, C, Hf*Wf)
-        # matmul: (B, Q, D) @ (B, D, Hf*Wf) -> (B, Q, Hf*Wf)
-        pred_masks_lowres = torch.matmul(mask_embeds, finest_features_flat)  # (B, Q, Hf*Wf)
-        pred_masks_lowres = pred_masks_lowres.view(B, -1, H_f, W_f)  # (B, Q, Hf, Wf)
-    
+        pred_masks_lowres = (mask_embeds @ finest_features.view(B, C, -1)).view(B, -1, H_f, W_f)
+
         # 7. Upsample masks to the original image size
         pred_masks = F.interpolate(
             pred_masks_lowres,
             size=pixel_values.shape[-2:],
-            mode="bilinear",
+            mode='bilinear',
             align_corners=False,
-        )  # (B, Q, H, W)
-    
+        )
+
         outputs = {
             "pred_logits": logits,
             "pred_boxes": pred_boxes,
             "pred_masks": pred_masks,
         }
-    
-        # 8. If targets are provided, compute losses via criterion
+
         if targets is not None:
             losses = self.criterion(outputs, targets)
             return outputs, losses
-    
+
         return outputs
