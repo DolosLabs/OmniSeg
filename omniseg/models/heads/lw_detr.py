@@ -89,30 +89,16 @@ except ImportError as e:
             input_level_start_index,
             input_padding_mask=None,
         ):
-            """
-            query: (N, Lq, C)
-            reference_points: (N, Lq, n_levels, 2/4)
-            input_flatten: (N, L, C)
-            input_spatial_shapes: (n_levels, 2)  # (H, W)
-            input_level_start_index: (n_levels,)
-            """
             N, Lq, C = query.shape
             N2, L, C2 = input_flatten.shape
             assert N == N2 and C == C2, "Shape mismatch between query and input_flatten"
-        
-            # (N, L, n_heads, head_dim)
             value = self.value_proj(input_flatten).view(N, L, self.n_heads, self.head_dim)
-        
-            # (N, Lq, n_heads, n_levels, n_points, 2)
             offsets = self.sampling_offsets(query).view(N, Lq, self.n_heads, self.n_levels, self.n_points, 2)
-        
-            # (N, Lq, n_heads, n_levels, n_points)
             attention_weights = self.attention_weights(query).view(N, Lq, self.n_heads, self.n_levels, self.n_points)
             attention_weights = F.softmax(attention_weights, -1)
-        
-            # compute sampling locations
+            
             if reference_points.shape[-1] == 2:
-                ref = reference_points.unsqueeze(2).unsqueeze(4)  # (N, Lq, 1, n_levels, 1, 2)
+                ref = reference_points.unsqueeze(2).unsqueeze(4)
                 offset_normalizer = torch.stack([input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
                 offset_normalizer = offset_normalizer[None, None, None, :, None, :]
                 sampling_locations = ref + offsets / offset_normalizer
@@ -120,36 +106,24 @@ except ImportError as e:
                 ref_xy = reference_points[..., :2].unsqueeze(2).unsqueeze(3).unsqueeze(4)
                 ref_wh = reference_points[..., 2:].unsqueeze(2).unsqueeze(3).unsqueeze(4)
                 sampling_locations = ref_xy + offsets / self.n_points * ref_wh * 0.5
-        
-            # split per level
+            
             splits = [H * W for H, W in input_spatial_shapes]
             value_list = value.split(splits, dim=1)
-        
             sampling_grids = 2 * sampling_locations - 1
             sampled_value_list = []
-        
+            
             for lvl, (H, W) in enumerate(input_spatial_shapes):
                 v_l = value_list[lvl].transpose(1, 2).reshape(N * self.n_heads, self.head_dim, H, W)
-                grid_l = sampling_grids[:, :, :, lvl]  # (N, Lq, n_heads, n_points, 2)
-                grid_l = grid_l.permute(0, 2, 1, 3, 4).reshape(N * self.n_heads, Lq * self.n_points, 2)
-                grid_l = grid_l.unsqueeze(1)  # (N*heads, 1, Lq*n_points, 2)
-        
-                sampled = F.grid_sample(
-                    v_l, grid_l, mode="bilinear", padding_mode="zeros", align_corners=False
-                )  # (N*heads, head_dim, 1, Lq*n_points)
-        
+                grid_l = sampling_grids[:, :, :, lvl].permute(0, 2, 1, 3, 4).reshape(N * self.n_heads, Lq * self.n_points, 2)
+                grid_l = grid_l.unsqueeze(1)
+                sampled = F.grid_sample(v_l, grid_l, mode="bilinear", padding_mode="zeros", align_corners=False)
                 sampled = sampled.squeeze(2).reshape(N, self.n_heads, self.head_dim, Lq, self.n_points)
                 sampled_value_list.append(sampled)
-        
-            # (N, n_heads, head_dim, Lq, n_levels, n_points)
+            
             sampled_values = torch.stack(sampled_value_list, dim=4)
-        
-            # (N, Lq, n_heads, n_levels, n_points) -> align with sampled_values
             attn = attention_weights.permute(0, 2, 3, 1, 4).unsqueeze(2)
-            # (N, n_heads, head_dim, Lq, n_levels, n_points) * (N, n_heads, 1, Lq, n_levels, n_points)
-            output = (sampled_values * attn).sum(-1).sum(4)  # sum over points and levels
+            output = (sampled_values * attn).sum(-1).sum(4)
             output = output.permute(0, 3, 1, 2).reshape(N, Lq, C)
-        
             return self.output_proj(output)
 
     DeformableAttention = PurePyTorchDeformableAttention  # type: ignore
@@ -171,15 +145,63 @@ def _get_clones(module: nn.Module, N: int) -> nn.ModuleList:
 
 # --- Backbone wrapper ---
 
+# 🚀 NEW: Path Aggregation Network (PANet) Module
+class PANetFPN(nn.Module):
+    """
+    A Path Aggregation Network (PANet) that enhances a standard FPN.
+    This module takes multi-scale features, processes them through a top-down
+    FPN pathway, and then adds a bottom-up pathway to improve localization.
+    """
+    def __init__(self, in_channels_list: list, out_channels: int):
+        super().__init__()
+        self.out_channels = out_channels
 
+        # 1. Standard FPN for the top-down pathway
+        self.fpn = FeaturePyramidNetwork(
+            in_channels_list=in_channels_list,
+            out_channels=out_channels,
+        )
+
+        # 2. Layers for the new bottom-up pathway
+        num_panet_blocks = len(in_channels_list) - 1
+        self.panet_convs = nn.ModuleList()
+        for _ in range(num_panet_blocks):
+            self.panet_convs.append(
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1)
+            )
+        
+        # 3. Output convolution for each final level
+        self.output_convs = nn.ModuleList()
+        for _ in range(len(in_channels_list)):
+            self.output_convs.append(
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+            )
+
+    def forward(self, features_dict: OrderedDict) -> OrderedDict:
+        # Run top-down pathway (FPN)
+        fpn_outputs = self.fpn(features_dict)
+        fpn_output_list = list(fpn_outputs.values())
+
+        # Run bottom-up pathway (PANet)
+        panet_outputs = [fpn_output_list[0]] # The first level is unchanged
+        for i in range(len(fpn_output_list) - 1):
+            downsampled_prev = self.panet_convs[i](panet_outputs[-1])
+            fused_feature = fpn_output_list[i + 1] + downsampled_prev
+            panet_outputs.append(fused_feature)
+
+        # Apply final convolutions and format output
+        final_outputs = OrderedDict()
+        for i, (feat, conv) in enumerate(zip(panet_outputs, self.output_convs)):
+             final_outputs[str(i)] = conv(feat)
+
+        return final_outputs
+
+# UPDATED: This class now uses the PANetFPN
 class GenericBackboneWithFPN(nn.Module):
     """
-    A generic wrapper to add a Feature Pyramid Network (FPN) to a backbone.
-
-    This module automatically discovers the output feature channels of the provided
-    backbone and connects them to an FPN to generate a multi-scale feature pyramid.
+    A generic wrapper to add a Feature Pyramid Network to a backbone.
+    This version has been updated to use the more powerful PANetFPN.
     """
-
     def __init__(
         self, backbone_type: str = 'dino', fpn_out_channels: int = 256, dummy_input_size: int = 224
     ):
@@ -192,29 +214,25 @@ class GenericBackboneWithFPN(nn.Module):
         with torch.no_grad():
             feat_dict = self.backbone(dummy_input)
 
-        # Ensure features are sorted to maintain consistent order for the FPN
         self._feature_keys = sorted(feat_dict.keys())
         in_channels_list = [feat_dict[k].shape[1] for k in self._feature_keys]
 
-        self.fpn = FeaturePyramidNetwork(
+        # Use the new PANetFPN module
+        self.fpn = PANetFPN(
             in_channels_list=in_channels_list, out_channels=self.out_channels
         )
 
     @property
     def num_feature_levels(self) -> int:
         return len(self._feature_keys)
-
+        
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Extracts features and processes them through the FPN."""
+        """Extracts features and processes them through the PANetFPN."""
         features = self.backbone(x)
-        
-        # Create an ordered dictionary of features for the FPN
         ordered_features = OrderedDict((k, features[k]) for k in self._feature_keys)
-        
+        # The call is the same, but now it uses the more powerful PANet
         fpn_output = self.fpn(ordered_features)
-        
-        # Remap keys to strings '0', '1', '2', etc., for DETR compatibility
-        return OrderedDict(zip(map(str, range(len(fpn_output))), fpn_output.values()))
+        return fpn_output
 
 
 # --- Decoder layer ---
@@ -320,14 +338,11 @@ def ia_bce_loss(pred_scores: torch.Tensor, target_classes: torch.Tensor, target_
     if pos_mask.any():
         b_idx, q_idx = pos_mask.nonzero(as_tuple=True)
         cls_idx = target_classes[b_idx, q_idx]
-        # 'u' is the IoU score with the ground truth
         u = target_ious[b_idx, q_idx].clamp(0.0, 1.0)
-        # t = s^alpha * u^(1-alpha)
         t_vals = (pred_prob[b_idx, q_idx, cls_idx].clamp(1e-6) ** alpha) * (u ** (1 - alpha))
         target_t[b_idx, q_idx, cls_idx] = t_vals
 
     bce = F.binary_cross_entropy(pred_prob, target_t, reduction="none")
-    # Weight negative samples by s^2
     neg_mask = target_classes < 0
     neg_weights = torch.where(neg_mask.unsqueeze(-1), pred_prob ** 2, torch.ones_like(pred_prob))
     return (bce * neg_weights).sum() / max(1, pos_mask.numel())
@@ -397,15 +412,6 @@ class SetCriterion(nn.Module):
 class LWDETRHead(BaseHead, nn.Module):
     """
     Main LW-DETR detection head with optional Group-DETR sequential decoding.
-
-    This class implements the main components of the LW-DETR architecture, including
-    the backbone wrapper, deformable decoder, and prediction heads. The default parameters
-    are set to match the 'LW-DETR-tiny' configuration from the paper.
-
-    LW-DETR Configurations (from Table 1):
-    - tiny:   d_model=192, num_queries=100, num_decoder_layers=3
-    - small:  d_model=192, num_queries=300, num_decoder_layers=3
-    - medium: d_model=384, num_queries=300, num_decoder_layers=3
     """
     def __init__(
         self,
@@ -420,23 +426,21 @@ class LWDETRHead(BaseHead, nn.Module):
         d_ffn: int = 1024,
         mask_dim: int = 16,
         # --- Group-DETR Specific Parameter ---
-        num_groups: int = 1, # Add this parameter
+        num_groups: int = 1,
         **kwargs,
     ):
-        # Pass kwargs to BaseHead to be robust
         BaseHead.__init__(self, num_classes, backbone_type, image_size, **kwargs)
         nn.Module.__init__(self)
 
         self.d_model = d_model
         self.num_queries = num_queries
-        self.num_groups = num_groups # Store the number of groups
+        self.num_groups = num_groups
         
-        # Add an assertion to ensure queries can be split evenly
         if self.num_groups > 1:
             assert self.num_queries % self.num_groups == 0, \
                 f"num_queries ({self.num_queries}) must be divisible by num_groups ({self.num_groups})"
 
-        # UPDATED LINE: Instantiates the new backbone class
+        # This line automatically uses the new PANet-based backbone wrapper
         self.backbone = GenericBackboneWithFPN(
             backbone_type=backbone_type, fpn_out_channels=d_model, dummy_input_size=image_size
         )
@@ -477,8 +481,6 @@ class LWDETRHead(BaseHead, nn.Module):
 
         memory = torch.cat(memory_list, dim=1)
         memory_spatial_shapes = torch.as_tensor(memory_spatial_shapes_list, dtype=torch.long, device=device)
-
-        # Compute level start indices
         sizes = [h * w for h, w in memory_spatial_shapes_list]
         level_start_index = torch.as_tensor([0] + sizes[:-1], dtype=torch.long, device=device).cumsum(0)
 
@@ -488,7 +490,6 @@ class LWDETRHead(BaseHead, nn.Module):
         decoder_output = query_embeds
 
         if self.num_groups == 1:
-            # Original behavior: pass all queries through all layers
             for layer in self.transformer_decoder:
                 decoder_output = layer(
                     tgt=decoder_output,
@@ -497,20 +498,15 @@ class LWDETRHead(BaseHead, nn.Module):
                     memory_spatial_shapes=memory_spatial_shapes,
                     level_start_index=level_start_index,
                 )
-        else:
-            # Group-DETR behavior: sequential group decoding
+        else: # Group-DETR behavior
             group_size = self.num_queries // self.num_groups
             all_group_outputs = []
             
-            # Iterate through each group
             for i in range(self.num_groups):
                 start, end = i * group_size, (i + 1) * group_size
-                
-                # Select the current group of queries and their reference points
                 group_queries = decoder_output[:, start:end, :]
                 group_ref_points = reference_points[:, start:end, :]
 
-                # Pass this single group through the entire stack of decoder layers
                 current_tgt = group_queries
                 for layer in self.transformer_decoder:
                     current_tgt = layer(
@@ -521,46 +517,29 @@ class LWDETRHead(BaseHead, nn.Module):
                         level_start_index=level_start_index,
                     )
                 
-                # Store the final refined output for this group
                 all_group_outputs.append(current_tgt)
 
-                # CRITICAL: Update the main decoder_output tensor in place.
-                # This allows the self-attention in the next group's processing
-                # to see the refined results of the current group.
                 if i < self.num_groups - 1:
                         decoder_output = torch.cat([
                             decoder_output[:, :start, :], 
                             current_tgt, 
                             decoder_output[:, end:, :]
-                        ], dim=1).detach() # Detach to prevent re-computing gradients
+                        ], dim=1).detach()
 
-            # Combine the final outputs from all groups
             decoder_output = torch.cat(all_group_outputs, dim=1)
-        
-        # --- END OF REPLACED LOGIC ---
 
         logits = self.class_embed(decoder_output)
         pred_boxes_delta = self.bbox_embed(decoder_output)
 
-        # Implements the box regression reparameterization from the LW-DETR paper
-        # reference_points are the proposal boxes 'p' in cxcywh format
-        # pred_boxes_delta are the predicted deltas [dx, dy, dw, dh]
         prop_center = reference_points[..., :2]
         prop_size = reference_points[..., 2:]
         delta_center = pred_boxes_delta[..., :2]
         delta_size = pred_boxes_delta[..., 2:]
-
-        # b_cx = delta_x * p_w + p_cx
         pred_center = delta_center * prop_size + prop_center
-
-        # b_w = exp(delta_w) * p_w
         pred_size = delta_size.exp() * prop_size
-
-        # Combine and apply sigmoid to ensure the output is a valid normalized box
         pred_boxes = torch.cat([pred_center, pred_size], dim=-1).sigmoid()
 
         pred_iou = self.iou_head(decoder_output)
-
         mask_embeds = self.mask_embed(decoder_output)
         pixel_feats = self.pixel_proj(srcs[0])
         pred_masks = torch.einsum("bqd,bdhw->bqhw", mask_embeds, pixel_feats)
