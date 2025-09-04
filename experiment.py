@@ -1,22 +1,25 @@
 import subprocess
 import glob
 import os
+import json # NEW: Import the json module to create the config string
+
 from huggingface_hub import login
-login(token='####')
+login()
+
 # Passing backbone-head combinations
 experiments = [
     #("dino", "maskrcnn"),
     ("dino", "lw_detr"),
     ("dino", "deformable_detr"),
-    #("convnext", "maskrcnn"),
-    ("convnext", "deformable_detr"),
-    ("convnext", "lw_detr"),
-    #("repvgg", "maskrcnn"),
+    #("convnext", "deformable_detr"),
+    ("convnext", "maskrcnn"),
+    #("convnext", "lw_detr"),
     ("repvgg", "deformable_detr"),
+    ("repvgg", "maskrcnn"),
     ("repvgg", "lw_detr"),
-    #("resnet", "maskrcnn"),
     ("resnet", "deformable_detr"),
-    ("resnet", "lw_detr"),
+    #("resnet", "lw_detr"),
+    ("resnet", "maskrcnn"),
 ]
 
 RUNS_DIR = "SSL_Instance_Segmentation/runs"
@@ -24,9 +27,20 @@ RUNS_DIR = "SSL_Instance_Segmentation/runs"
 for backbone, head in experiments:
     # batch size rule
     if backbone in ["repvgg", "resnet"]:
-        batch_size = 16
+        batch_size = 40
+        early_stop = 5
+        val_epoch = 1
+        epochs = 50
+    elif head in ["maskrcnn"]:
+        batch_size = 40
+        early_stop = 5
+        val_epoch = 1
+        epochs = 50
     else:
-        batch_size = 32
+        batch_size = 512
+        early_stop = 50
+        val_epoch = 10
+        epochs = 1000
 
     print(f"\n🚀 Starting training: backbone={backbone}, head={head}, batch_size={batch_size}\n")
 
@@ -37,9 +51,23 @@ for backbone, head in experiments:
         "--head", head,
         "--batch_size", str(batch_size),
         "--image_size", str(64),
+        "--learning_rate", str(1e-4),
+        "--val_every_n_epoch", str(val_epoch),
+        "--early_stopping_patience", str(early_stop),
+        "--epochs", str(epochs)
     ]
 
-    if head in ["deformable_detr", "contourformer",'lw_detr']:
+    # NEW: Add adjusted head configuration for DETR-style models on small images
+    if head in ["deformable_detr", "contourformer", "lw_detr"]:
+        # These parameters are optimized for small 64x64 images
+        head_config = {
+            "num_queries": 52,             # A safer default, especially if objects per image can exceed 50.
+            "d_model": 256,                 # Standard dimension for robust feature representation.
+            "num_decoder_layers": 4,        # Standard depth for effective prediction refinement.
+            "num_groups": 13
+        }
+        # Add the config as a JSON string to the command
+        cmd.extend(["--head_config", json.dumps(head_config)])
         cmd.append("--find_unused_parameters")
 
     subprocess.run(cmd, check=True)
@@ -55,8 +83,8 @@ for backbone, head in experiments:
     best_ckpts.sort()
     best_ckpt = best_ckpts[-1]
 
-    print(f"\n📊 Running visualization for {backbone}_{head} using {best_ckpt}\n")
+    # print(f"\n📊 Running visualization for {backbone}_{head} using {best_ckpt}\n")
 
-    # --- Run visualization ---
-    viz_cmd = ["python", "visualize_model.py", best_ckpt]
-    subprocess.run(viz_cmd, check=True)
+    # # --- Run visualization ---
+    # viz_cmd = ["python", "visualize_model.py", best_ckpt]
+    # subprocess.run(viz_cmd, check=True)
