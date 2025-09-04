@@ -26,10 +26,10 @@
   "simple_lw_detr": {
     "backbone": "simple",
     "head": "lw_detr",
-    "status": "failed",
-    "instantiation": false,
-    "forward_pass": false,
-    "error": "Head failed: The size of tensor a (4) must match the size of tensor b (100) at non-singleton dimension 4"
+    "status": "working",
+    "instantiation": true,
+    "forward_pass": true,
+    "error": null
   },
   "dino_maskrcnn": {
     "backbone": "dino",
