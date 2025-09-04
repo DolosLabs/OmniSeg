@@ -49,7 +49,7 @@ class GenericBackboneWithFPN(nn.Module):
 class MaskRCNNHead(BaseHead, nn.Module):
     """Mask R-CNN segmentation head."""
     
-    def __init__(self, num_classes: int, backbone_type: str = 'dino', image_size: int = 224, anchor_base_size: int = 32):
+    def __init__(self, num_classes: int, backbone_type: str = 'dino', image_size: int = 224, anchor_base_size: int = 32,**kwargs,):
         BaseHead.__init__(self, num_classes, backbone_type, image_size)
         nn.Module.__init__(self)
         
