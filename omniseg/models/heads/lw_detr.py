@@ -44,12 +44,17 @@ class BaseHead:
 
 # --- Deformable attention (attempt import, fallback if needed) ---
 
-try:
-    from torchvision.ops.deformable_attention import DeformableAttention  # type: ignore
-    print("INFO: Successfully imported torchvision DeformableAttention.")
-except Exception:
-    print("WARNING: torchvision DeformableAttention unavailable. Using pure-PyTorch fallback.")
 
+try:
+    from torchvision.ops.deformable_attention import DeformableAttention
+    print("INFO: Successfully imported torchvision DeformableAttention.")
+except ImportError as e:
+    print("=" * 60)
+    print("CRITICAL WARNING: Failed to import the official DeformableAttention.")
+    print(f"THE IMPORT ERROR WAS: {e}")
+    print("Falling back to the pure-PyTorch implementation, which is causing errors.")
+    print("Please check your torch/torchvision/CUDA installation.")
+    print("=" * 60)
     class PurePyTorchDeformableAttention(nn.Module):
         def __init__(self, d_model, n_levels, n_heads, n_points):
             super().__init__()
@@ -58,13 +63,13 @@ except Exception:
             self.n_points = n_points
             self.d_model = d_model
             self.head_dim = d_model // n_heads
-
+    
             self.sampling_offsets = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
             self.attention_weights = nn.Linear(d_model, n_heads * n_levels * n_points)
             self.value_proj = nn.Linear(d_model, d_model)
             self.output_proj = nn.Linear(d_model, d_model)
             self._reset_parameters()
-
+    
         def _reset_parameters(self):
             nn.init.constant_(self.sampling_offsets.weight, 0.0)
             nn.init.constant_(self.sampling_offsets.bias, 0.0)
@@ -74,7 +79,7 @@ except Exception:
             nn.init.constant_(self.value_proj.bias, 0.0)
             nn.init.xavier_uniform_(self.output_proj.weight)
             nn.init.constant_(self.output_proj.bias, 0.0)
-
+    
         def forward(
             self,
             query,
@@ -84,54 +89,67 @@ except Exception:
             input_level_start_index,
             input_padding_mask=None,
         ):
+            """
+            query: (N, Lq, C)
+            reference_points: (N, Lq, n_levels, 2/4)
+            input_flatten: (N, L, C)
+            input_spatial_shapes: (n_levels, 2)  # (H, W)
+            input_level_start_index: (n_levels,)
+            """
             N, Lq, C = query.shape
             N2, L, C2 = input_flatten.shape
-            assert N == N2 and C == C2, "shape mismatch between query and input_flatten"
-
+            assert N == N2 and C == C2, "Shape mismatch between query and input_flatten"
+    
+            # (N, L, n_heads, head_dim)
             value = self.value_proj(input_flatten).view(N, L, self.n_heads, self.head_dim)
+    
+            # (N, Lq, n_heads, n_levels, n_points, 2)
             offsets = self.sampling_offsets(query).view(N, Lq, self.n_heads, self.n_levels, self.n_points, 2)
-            attention_weights = self.attention_weights(query).view(N, Lq, self.n_heads, self.n_levels * self.n_points)
-            attention_weights = F.softmax(attention_weights, -1).view(N, Lq, self.n_heads, self.n_levels, self.n_points)
-
+    
+            # (N, Lq, n_heads, n_levels, n_points)
+            attention_weights = self.attention_weights(query).view(N, Lq, self.n_heads, self.n_levels, self.n_points)
+            attention_weights = F.softmax(attention_weights, -1)
+    
+            # compute sampling locations
             if reference_points.shape[-1] == 2:
-                if reference_points.ndim == 3:
-                    reference_points = reference_points.unsqueeze(2)
-                ref_exp = reference_points.unsqueeze(2).unsqueeze(4)
+                ref = reference_points.unsqueeze(2).unsqueeze(4)  # (N, Lq, 1, n_levels, 1, 2)
                 offset_normalizer = torch.stack([input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
                 offset_normalizer = offset_normalizer[None, None, None, :, None, :]
-                sampling_locations = ref_exp + offsets / offset_normalizer
+                sampling_locations = ref + offsets / offset_normalizer
             else:
-                # Handle 4D reference points [cx, cy, w, h] correctly for a 3D tensor
-                # First, slice the tensor to get center and size
-                ref_xy = reference_points[..., :2]
-                ref_wh = reference_points[..., 2:]
-
-                # Then, unsqueeze to add dimensions for broadcasting with offsets
-                ref_xy = ref_xy.unsqueeze(2).unsqueeze(3).unsqueeze(4)
-                ref_wh = ref_wh.unsqueeze(2).unsqueeze(3).unsqueeze(4)
-
-                sampling_locations = (
-                    ref_xy + offsets / self.n_points * ref_wh * 0.5
-                )
-
-            # split value by level
+                ref_xy = reference_points[..., :2].unsqueeze(2).unsqueeze(3).unsqueeze(4)
+                ref_wh = reference_points[..., 2:].unsqueeze(2).unsqueeze(3).unsqueeze(4)
+                sampling_locations = ref_xy + offsets / self.n_points * ref_wh * 0.5
+    
+            # split per level
             splits = [H * W for H, W in input_spatial_shapes]
             value_list = value.split(splits, dim=1)
-
-            sampling_grids = 2 * sampling_locations - 1  # to grid_sample coordinate system
+    
+            sampling_grids = 2 * sampling_locations - 1
             sampled_value_list = []
-
-            for level, (H, W) in enumerate(input_spatial_shapes):
-                v_l = value_list[level].transpose(1, 2).reshape(N * self.n_heads, self.head_dim, H, W)
-                grid_l = sampling_grids[:, :, :, level].transpose(1, 2).flatten(0, 1)
-                sampled = F.grid_sample(v_l, grid_l, mode="bilinear", padding_mode="zeros", align_corners=False)
+    
+            for lvl, (H, W) in enumerate(input_spatial_shapes):
+                v_l = value_list[lvl].transpose(1, 2).reshape(N * self.n_heads, self.head_dim, H, W)
+                grid_l = sampling_grids[:, :, :, lvl]  # (N, Lq, n_heads, n_points, 2)
+                grid_l = grid_l.permute(0, 2, 1, 3, 4).reshape(N * self.n_heads, Lq * self.n_points, 2)
+                grid_l = grid_l.unsqueeze(1)  # (N*heads, 1, Lq*n_points, 2)
+    
+                sampled = F.grid_sample(
+                    v_l, grid_l, mode="bilinear", padding_mode="zeros", align_corners=False
+                )  # (N*heads, head_dim, 1, Lq*n_points)
+    
+                sampled = sampled.squeeze(2).reshape(N, self.n_heads, self.head_dim, Lq, self.n_points)
                 sampled_value_list.append(sampled)
-
-            attention_weights = attention_weights.unsqueeze(-1)
-            sampled_values = torch.stack(sampled_value_list, dim=-1).view(
-                N, self.n_heads, self.head_dim, Lq, self.n_levels, self.n_points
-            )
-            output = (sampled_values.permute(0, 3, 1, 4, 5, 2) * attention_weights).sum(-2).view(N, Lq, C)
+    
+            # (N, n_heads, head_dim, Lq, n_levels, n_points)
+            sampled_values = torch.stack(sampled_value_list, dim=4)
+    
+            # (N, Lq, n_heads, n_levels, n_points) -> align with sampled_values
+            attn = attention_weights.permute(0, 2, 3, 1, 4).unsqueeze(2)
+            # (N, n_heads, head_dim, Lq, n_levels, n_points) * (N, n_heads, 1, Lq, n_levels, n_points)
+            output = (sampled_values * attn).sum(-1).sum(4)  # sum over points and levels
+            output = output.permute(0, 3, 1, 2).reshape(N, Lq, C)
+    
             return self.output_proj(output)
 
     DeformableAttention = PurePyTorchDeformableAttention  # type: ignore
@@ -433,17 +451,15 @@ class SetCriterion(nn.Module):
 
 
 # --- Main DETR head ---
-
-
 class LWDETRHead(BaseHead, nn.Module):
     """
-    Main LW-DETR detection head.
+    Main LW-DETR detection head with optional Group-DETR sequential decoding.
 
     This class implements the main components of the LW-DETR architecture, including
     the backbone wrapper, deformable decoder, and prediction heads. The default parameters
-    [cite_start]are set to match the 'LW-DETR-tiny' configuration from the paper[cite: 134, 138].
+    are set to match the 'LW-DETR-tiny' configuration from the paper.
 
-    [cite_start]LW-DETR Configurations (from Table 1)[cite: 134]:
+    LW-DETR Configurations (from Table 1):
     - tiny:   d_model=192, num_queries=100, num_decoder_layers=3
     - small:  d_model=192, num_queries=300, num_decoder_layers=3
     - medium: d_model=384, num_queries=300, num_decoder_layers=3
@@ -460,12 +476,22 @@ class LWDETRHead(BaseHead, nn.Module):
         n_heads: int = 8,
         d_ffn: int = 1024,
         mask_dim: int = 16,
+        # --- Group-DETR Specific Parameter ---
+        num_groups: int = 1, # Add this parameter
+        **kwargs,
     ):
-        BaseHead.__init__(self, num_classes, backbone_type, image_size)
+        # Pass kwargs to BaseHead to be robust
+        BaseHead.__init__(self, num_classes, backbone_type, image_size, **kwargs)
         nn.Module.__init__(self)
 
         self.d_model = d_model
         self.num_queries = num_queries
+        self.num_groups = num_groups # Store the number of groups
+        
+        # Add an assertion to ensure queries can be split evenly
+        if self.num_groups > 1:
+            assert self.num_queries % self.num_groups == 0, \
+                f"num_queries ({self.num_queries}) must be divisible by num_groups ({self.num_groups})"
 
         self.backbone = BackboneWithOptionalFPN(backbone_type, out_channels=d_model, image_size=image_size)
         self.num_feature_levels = self.backbone.num_feature_levels
@@ -473,7 +499,6 @@ class LWDETRHead(BaseHead, nn.Module):
         self.query_embed = nn.Embedding(num_queries, d_model)
 
         decoder_layer = DeformableTransformerDecoderLayer(d_model=d_model, n_heads=n_heads, d_ffn=d_ffn, n_levels=self.num_feature_levels)
-        # [cite_start]A stack of N identical decoder layers is used [cite: 100]
         self.transformer_decoder = nn.ModuleList(_get_clones(decoder_layer, num_decoder_layers))
 
         # Prediction heads
@@ -488,8 +513,7 @@ class LWDETRHead(BaseHead, nn.Module):
 
     def _init_criterion(self):
         matcher = HungarianMatcher()
-        # [cite_start]Loss weights match those used in DETR variants [cite: 129]
-        weight_dict = {"loss_cls": 1.0, "loss_bbox": 5.0, "loss_giou": 2.0, "loss_mask": 2.0, "loss_dice": 2.0}
+        weight_dict = {"loss_cls": 2.0, "loss_bbox": 6.0, "loss_giou": 3.0, "loss_mask": 2.0, "loss_dice": 2.0}
         self.criterion = SetCriterion(self.num_classes, matcher=matcher, weight_dict=weight_dict)
 
     def forward(self, pixel_values: torch.Tensor, targets: Optional[List[Dict]] = None):
@@ -514,24 +538,65 @@ class LWDETRHead(BaseHead, nn.Module):
 
         # Decoder
         query_embeds = self.query_embed.weight.unsqueeze(0).expand(pixel_values.shape[0], -1, -1)
-        # NOTE: This uses a one-stage, DINO-style query mechanism, not the two-stage
-        # [cite_start]mixed-query selection from the LW-DETR paper[cite: 104].
         reference_points = self.query_scale(query_embeds).sigmoid()
         decoder_output = query_embeds
 
-        for layer in self.transformer_decoder:
-            decoder_output = layer(
-                tgt=decoder_output,
-                memory=memory,
-                ref_points_c=reference_points,
-                memory_spatial_shapes=memory_spatial_shapes,
-                level_start_index=level_start_index,
-            )
+        if self.num_groups == 1:
+            # Original behavior: pass all queries through all layers
+            for layer in self.transformer_decoder:
+                decoder_output = layer(
+                    tgt=decoder_output,
+                    memory=memory,
+                    ref_points_c=reference_points,
+                    memory_spatial_shapes=memory_spatial_shapes,
+                    level_start_index=level_start_index,
+                )
+        else:
+            # Group-DETR behavior: sequential group decoding
+            group_size = self.num_queries // self.num_groups
+            all_group_outputs = []
+            
+            # Iterate through each group
+            for i in range(self.num_groups):
+                start, end = i * group_size, (i + 1) * group_size
+                
+                # Select the current group of queries and their reference points
+                group_queries = decoder_output[:, start:end, :]
+                group_ref_points = reference_points[:, start:end, :]
+
+                # Pass this single group through the entire stack of decoder layers
+                current_tgt = group_queries
+                for layer in self.transformer_decoder:
+                    current_tgt = layer(
+                        tgt=current_tgt,
+                        memory=memory,
+                        ref_points_c=group_ref_points,
+                        memory_spatial_shapes=memory_spatial_shapes,
+                        level_start_index=level_start_index,
+                    )
+                
+                # Store the final refined output for this group
+                all_group_outputs.append(current_tgt)
+
+                # CRITICAL: Update the main decoder_output tensor in place.
+                # This allows the self-attention in the next group's processing
+                # to see the refined results of the current group.
+                if i < self.num_groups - 1:
+                     decoder_output = torch.cat([
+                        decoder_output[:, :start, :], 
+                        current_tgt, 
+                        decoder_output[:, end:, :]
+                    ], dim=1).detach() # Detach to prevent re-computing gradients
+
+            # Combine the final outputs from all groups
+            decoder_output = torch.cat(all_group_outputs, dim=1)
+        
+        # --- END OF REPLACED LOGIC ---
 
         logits = self.class_embed(decoder_output)
         pred_boxes_delta = self.bbox_embed(decoder_output)
 
-        # [cite_start]Implements the box regression reparameterization from the LW-DETR paper [cite: 544, 556, 558]
+        # Implements the box regression reparameterization from the LW-DETR paper
         # reference_points are the proposal boxes 'p' in cxcywh format
         # pred_boxes_delta are the predicted deltas [dx, dy, dw, dh]
         prop_center = reference_points[..., :2]
