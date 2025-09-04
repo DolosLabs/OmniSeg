@@ -317,7 +317,7 @@ class DeformableCrossAttention(nn.Module):
 
 class ContourFormerDecoderLayer(nn.Module):
     """A single decoder layer for ContourFormer using decoupled attention."""
-    def __init__(self, d_model=256, n_heads=8, n_points=4, dim_feedforward=2048, dropout=0.1):
+    def __init__(self, d_model=256, n_heads=8, n_points=4, dim_feedforward=2048, dropout=0.1, **kwargs,):
         super().__init__()
         self.self_attn = DecoupledSelfAttention(d_model, n_heads, dropout)
         self.cross_attn = DeformableCrossAttention(d_model, n_heads, n_points)
