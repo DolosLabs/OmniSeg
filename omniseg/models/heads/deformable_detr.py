@@ -395,11 +395,17 @@ class DETRSegmentationHead(BaseHead, nn.Module):
     
                 # Update the main decoder output to include refined group (except last group)
                 if i < self.num_groups - 1:
+                    # Fix: Remove .detach() to allow gradient flow between groups
+                    # This enables proper inter-group learning in Group-DETR
                     decoder_output = torch.cat([
                         decoder_output[:, :start, :],
                         current_tgt,
                         decoder_output[:, end:, :]
-                    ], dim=1).detach()
+                    ], dim=1)
+                    
+                    # Optional: Apply gradient scaling to prevent instability
+                    # This scales gradients by 0.5 to maintain stability while preserving flow
+                    decoder_output = decoder_output * 0.5 + decoder_output.detach() * 0.5
     
             # Concatenate all group outputs
             decoder_output = torch.cat(all_group_outputs, dim=1)
