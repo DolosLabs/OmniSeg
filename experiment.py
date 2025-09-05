@@ -8,39 +8,41 @@ login()
 
 # Passing backbone-head combinations
 experiments = [
-    #("dino", "maskrcnn"),
+    ("dino", "maskrcnn"),
     ("dino", "lw_detr"),
     ("dino", "deformable_detr"),
-    #("convnext", "deformable_detr"),
+    ("convnext", "deformable_detr"),
     ("convnext", "maskrcnn"),
-    #("convnext", "lw_detr"),
+    ("convnext", "lw_detr"),
     ("repvgg", "deformable_detr"),
     ("repvgg", "maskrcnn"),
     ("repvgg", "lw_detr"),
     ("resnet", "deformable_detr"),
-    #("resnet", "lw_detr"),
+    ("resnet", "lw_detr"),
     ("resnet", "maskrcnn"),
+    ("dino", "sparrow_seg")
 ]
 
 RUNS_DIR = "SSL_Instance_Segmentation/runs"
+image_size = 128
 
 for backbone, head in experiments:
     # batch size rule
-    if backbone in ["repvgg", "resnet"]:
-        batch_size = 40
+    if backbone in ["repvgg", "resnet", "convnext"]:
+        batch_size = 16
         early_stop = 5
         val_epoch = 1
         epochs = 50
     elif head in ["maskrcnn"]:
-        batch_size = 40
+        batch_size = 16
         early_stop = 5
         val_epoch = 1
         epochs = 50
     else:
-        batch_size = 512
+        batch_size = 128
         early_stop = 50
         val_epoch = 10
-        epochs = 1000
+        epochs = 150
 
     print(f"\n🚀 Starting training: backbone={backbone}, head={head}, batch_size={batch_size}\n")
 
@@ -50,7 +52,7 @@ for backbone, head in experiments:
         "--backbone", backbone,
         "--head", head,
         "--batch_size", str(batch_size),
-        "--image_size", str(64),
+        "--image_size", str(image_size),
         "--learning_rate", str(1e-4),
         "--val_every_n_epoch", str(val_epoch),
         "--early_stopping_patience", str(early_stop),
@@ -69,11 +71,13 @@ for backbone, head in experiments:
         # Add the config as a JSON string to the command
         cmd.extend(["--head_config", json.dumps(head_config)])
         cmd.append("--find_unused_parameters")
+    elif head in ["sparrow_seg"]:
+        cmd.append("--find_unused_parameters")
 
     subprocess.run(cmd, check=True)
 
     # --- Find best checkpoint ---
-    run_path = os.path.join(RUNS_DIR, f"{backbone}_{head}_64")
+    run_path = os.path.join(RUNS_DIR, f"{backbone}_{head}_{image_size}")
     best_ckpts = glob.glob(os.path.join(run_path, "best-model-epoch*"))
 
     if not best_ckpts:
@@ -85,6 +89,6 @@ for backbone, head in experiments:
 
     # print(f"\n📊 Running visualization for {backbone}_{head} using {best_ckpt}\n")
 
-    # # --- Run visualization ---
-    # viz_cmd = ["python", "visualize_model.py", best_ckpt]
-    # subprocess.run(viz_cmd, check=True)
+    # --- Run visualization ---
+    viz_cmd = ["python", "visualize_model.py", best_ckpt,"--backbone",backbone]
+    subprocess.run(viz_cmd, check=True)
