@@ -99,8 +99,6 @@ Here are some sample predictions and performance metrics from different model co
 | **DINO** | Deformable DETR | 149 | 0.2605 | ![DINO + Deformable DETR](docs/dino_deformable_detr_predictions_best-model-epoch=149-val_mAP=0.2605.png) |
 | **DINO** | LW-DETR | 139 | 0.1657 | ![DINO + LW-DETR](docs/dino_lw_detr_predictions_best-model-epoch=139-val_mAP=0.1657.png) |
 | **DINO** | Sparrow-Seg | 149 | 0.1569 | ![DINO + Sparrow-Seg](docs/dino_sparrow_seg_predictions_best-model-epoch=149-val_mAP=0.1569.png) |
-| **RepVGG** | Deformable DETR | 5 | 0.0030 | ![RepVGG + Deformable DETR](docs/repvgg_deformable_detr_predictions_best-model-epoch=05-val_mAP=0.0030.png) |
-| **ConvNeXt** | Deformable DETR | 1 | 0.0000 | ![ConvNeXt + Deformable DETR](docs/convnext_deformable_detr_predictions_best-model-epoch=01-val_mAP=0.0000.png) |
 
 To generate your own visualizations from a checkpoint:
 
