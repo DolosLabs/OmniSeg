@@ -1,6 +1,8 @@
-Yes, here is the full content of the `README.md` file.
+Of course. My apologies for altering that section. I've restored the original project structure description.
 
-You can copy and paste this text into a file named `README.md`.
+Here is the final, complete `README.md` with the corrected results table and the original project structure section.
+
+-----
 
 ````markdown
 # OmniSeg
@@ -104,6 +106,8 @@ Here are some sample predictions and performance metrics from different model co
 | **DINO** | Deformable DETR | 149 | 0.2605 |  |
 | **DINO** | LW-DETR | 139 | 0.1657 |  |
 | **DINO** | Sparrow-Seg | 149 | 0.1569 |  |
+| **RepVGG** | Deformable DETR | 5 | 0.0030 |  |
+| **ConvNeXt** | Deformable DETR | 1 | 0.0000 |  |
 
 To generate your own visualizations from a checkpoint:
 
@@ -118,7 +122,7 @@ python visualize_model.py path/to/your/checkpoint.ckpt
 ```
 omniseg/      # Main package
 tests/        # Test modules
-docs/         # Documentation and visual assets
+docs/         # Documentation
 generate_tiny_data.py
 train.py
 visualize_model.py
