@@ -104,8 +104,6 @@ Here are some sample predictions and performance metrics from different model co
 | **DINO** | Deformable DETR | 149 | 0.2605 |  |
 | **DINO** | LW-DETR | 139 | 0.1657 |  |
 | **DINO** | Sparrow-Seg | 149 | 0.1569 |  |
-| **RepVGG** | Deformable DETR | 5 | 0.0030 |  |
-| **ConvNeXt** | Deformable DETR | 1 | 0.0000 |  |
 
 To generate your own visualizations from a checkpoint:
 
