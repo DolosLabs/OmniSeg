@@ -20,7 +20,8 @@ from omniseg.models.heads.contourformer import contours_to_masks
 from omniseg.models.heads.deformable_detr import DETRSegmentationHead
 from omniseg.models.heads.contourformer import ContourFormerHead
 from omniseg.models.heads.maskrcnn import MaskRCNNHead
-from omniseg.models.heads.lw_detr import LWDETRHead # Ensure this import path is correct
+from omniseg.models.heads.lw_detr import LWDETRHead
+from omniseg.models.heads.sparrow_seg import SparrowSegHead # MODIFIED: Import SparrowSegHead
 
 # --- Constants ---
 CONFIDENCE_THRESHOLD = 0.5
@@ -83,9 +84,24 @@ def build_head_from_hparams(hparams: Dict[str, Any]) -> torch.nn.Module:
             pre_norm=False,
             control_points=16
         )
+    # MODIFIED: Correctly instantiate SparrowSegHead
+    elif head_type == 'sparrow_seg':
+        # NOTE: Ensure these parameters match those used during training!
+        return SparrowSegHead(
+            num_classes=num_classes,
+            backbone_type=hparams.get('backbone_type', 'dino'),
+            image_size=hparams.get('image_size', 512),
+            d_model=hparams.get('d_model', 256),
+            num_queries=hparams.get('num_queries', 100),
+            num_decoder_layers=hparams.get('num_decoder_layers', 2),
+            n_heads=hparams.get('n_heads', 8),
+            d_ffn=hparams.get('d_ffn', 1024),
+            mask_dim=hparams.get('mask_dim', 256)
+        )
     elif head_type == 'maskrcnn':
         # NOTE: Adjust these parameters as needed
         return MaskRCNNHead(
+            backbone_type=hparams.get('backbone_type', 'dino'),
             num_classes=num_classes
         )
     else:
@@ -155,7 +171,8 @@ def process_predictions(model_hparams: Dict[str, Any], raw_outputs: Any, origina
             print(f"Error processing ContourFormer outputs: {e}")
             return {"masks": np.array([]), "labels": np.array([]), "scores": np.array([])}
 
-    elif head_type in ['deformable_detr', 'lw_detr']: # MODIFIED: Handle both DETR types here
+    # MODIFIED: Add 'sparrow_seg' to the list of DETR-like models
+    elif head_type in ['deformable_detr', 'lw_detr', 'sparrow_seg']:
         try:
             if isinstance(raw_outputs, dict):
                 logits = raw_outputs.get("pred_logits")
@@ -165,7 +182,7 @@ def process_predictions(model_hparams: Dict[str, Any], raw_outputs: Any, origina
                     if logits.dim() == 3: logits = logits[0]
                     if masks.dim() == 4: masks = masks[0]
                     
-                    # For DETR, last class is "no object"
+                    # For DETR-like models, last class is "no object"
                     scores_softmax = logits.softmax(-1)[:, :-1]
                     scores, labels = scores_softmax.max(-1)
                     keep_mask = scores > CONFIDENCE_THRESHOLD
@@ -204,22 +221,28 @@ def create_mask_overlay(image: Image.Image, masks: np.ndarray, colors: np.ndarra
         
     combined_mask_color = np.zeros((*image.size[::-1], 3), dtype=np.float32)
     
+    # MODIFIED: Use a single, distinct color (white) and adjust transparency
+    # for better visibility. Original colors_list can still be passed but
+    # we'll override for the overlay effect.
+    overlay_color = np.array([1.0, 1.0, 1.0]) # White color
+    alpha = 0.6 # Increased transparency for better visibility
+
     for i, mask in enumerate(masks):
-        color = colors[i % len(colors), :3]
         if isinstance(mask, torch.Tensor):
             mask = mask.detach().cpu().numpy()
 
-        # The mask should already be the correct size from process_predictions
         resized_mask = (mask > 0.5)
         
         for c in range(3):
-            combined_mask_color[resized_mask, c] = color[c]
+            combined_mask_color[resized_mask, c] = overlay_color[c]
             
     image_arr = np.array(image) / 255.0
-    # Create overlay where there are masks
-    overlay_area = np.any(combined_mask_color > 0, axis=-1)
     overlay = image_arr.copy()
-    overlay[overlay_area] = 0.6 * image_arr[overlay_area] + 0.4 * combined_mask_color[overlay_area]
+    
+    # Apply the white overlay only where masks exist
+    overlay_area = np.any(combined_mask_color > 0, axis=-1)
+    overlay[overlay_area] = (1 - alpha) * image_arr[overlay_area] + alpha * combined_mask_color[overlay_area]
+    
     return np.clip(overlay, 0, 1)
 
 # --- Main Visualization Logic ---
@@ -237,6 +260,7 @@ def visualize_model(checkpoint_path: str, project_dir: str, num_images: int, bac
     print("Loading checkpoint to extract hyperparameters...")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     hparams = checkpoint['hyper_parameters']
+    hparams['backbone_type'] = backbone
     
     # 1. Build the model head from hyperparameters
     head = build_head_from_hparams(hparams)
@@ -289,7 +313,7 @@ def visualize_model(checkpoint_path: str, project_dir: str, num_images: int, bac
 
         gt_masks = target.get('masks')
         if gt_masks is not None and len(gt_masks) > 0:
-            gt_overlay = create_mask_overlay(image_pil, gt_masks.numpy(), colors_list)
+            gt_overlay = create_mask_overlay(image_pil, gt_masks.numpy(), colors_list) # Keep original colors for GT
             axes[i, 1].imshow(gt_overlay)
         else:
             axes[i, 1].imshow(image_pil)
@@ -297,7 +321,7 @@ def visualize_model(checkpoint_path: str, project_dir: str, num_images: int, bac
 
         pred_masks = predictions['masks']
         if pred_masks.shape[0] > 0:
-            pred_overlay = create_mask_overlay(image_pil, pred_masks, colors_list)
+            pred_overlay = create_mask_overlay(image_pil, pred_masks, colors_list) # Now this will be white
             axes[i, 2].imshow(pred_overlay)
         else:
             axes[i, 2].imshow(image_pil)
