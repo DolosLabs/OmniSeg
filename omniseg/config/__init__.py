@@ -5,7 +5,7 @@ from typing import Dict, Any, List
 # --- Main Configuration ---
 PROJECT_DIR = './SSL_Instance_Segmentation'
 EPOCHS = 100
-NUM_CLASSES = 10
+NUM_CLASSES = 3
 
 # Backbone and Head Configuration
 BACKBONE_CONFIGS = {
@@ -22,7 +22,8 @@ HEAD_CONFIGS = {
     'maskrcnn': {'precision': '16-mixed', 'batch_size': 8},
     'contourformer': {'precision': '32', 'batch_size': 4},
     'deformable_detr': {'precision': '32', 'batch_size': 4},
-    'lw_detr': {'precision': '32', 'batch_size': 4}
+    'lw_detr': {'precision': '32', 'batch_size': 4},
+    'sparrow_seg': {'precision': '32', 'batch_size': 4}
 }
 
 
