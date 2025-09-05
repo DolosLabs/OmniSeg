@@ -15,7 +15,7 @@ A versatile, semi-supervised instance segmentation framework built on PyTorch Li
   - **ContourFormer:** A custom head that predicts object contours directly. Running but slow convergence.
   - **Deformable DETR:** Advanced DETR-based instance segmentation head. With GroupDETR.
   - **LW-DETR++:** Advanced DETR-based instance segmentation head that connects to different backbones. With GroupDETR.
-  - **Sparrow-Seg:** Lightweight segmentation head designed for speed–accuracy balance, optimized for resource-constrained training and faster convergence.
+  - **Sparrow-Seg:** Our first AI-generated segmentation head, designed for a speed–accuracy balance, optimized for resource-constrained training and faster convergence.
 - **PyTorch Lightning:** Simplifies boilerplate code, ensures reproducibility, and supports distributed training.
 - **Automated Data Handling:** Automatically downloads and prepares the COCO 2017 dataset, or use the tiny synthetic dataset for quick testing.
 
