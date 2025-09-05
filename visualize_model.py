@@ -44,6 +44,7 @@ def build_head_from_hparams(hparams: Dict[str, Any]) -> torch.nn.Module:
         return DETRSegmentationHead(
             num_classes=num_classes,
             backbone_type=hparams.get('backbone_type', 'dino'),
+            image_size=hparams.get('image_size', 128),
             hidden_dim=hparams.get('d_model', 256),
             num_queries=hparams.get('num_queries', 52),
             dec_layers=hparams.get('num_decoder_layers', 4),
@@ -60,7 +61,7 @@ def build_head_from_hparams(hparams: Dict[str, Any]) -> torch.nn.Module:
         return LWDETRHead(
             num_classes=num_classes,
             backbone_type=hparams.get('backbone_type', 'dino'),
-            image_size=hparams.get('image_size', 64),
+            image_size=hparams.get('image_size', 128),
             d_model=hparams.get('d_model', 256),
             num_queries=hparams.get('num_queries', 52),
             num_decoder_layers=hparams.get('num_decoder_layers', 4),
@@ -223,7 +224,7 @@ def create_mask_overlay(image: Image.Image, masks: np.ndarray, colors: np.ndarra
 
 # --- Main Visualization Logic ---
 
-def visualize_model(checkpoint_path: str, project_dir: str, num_images: int):
+def visualize_model(checkpoint_path: str, project_dir: str, num_images: int, backbone: str):
     """
     Loads a model and visualizes its predictions on validation images.
     """
@@ -309,7 +310,6 @@ def visualize_model(checkpoint_path: str, project_dir: str, num_images: int):
     output_dir = os.path.join(project_dir, 'visualizations')
     os.makedirs(output_dir, exist_ok=True)
     
-    backbone = model.hparams.get('backbone_type', 'unknown_backbone')
     head_name = model.hparams.get('head_type', 'unknown_head')
     ckpt_name = os.path.splitext(os.path.basename(checkpoint_path))[0]
     image_prefix = f"{backbone}_{head_name}"
@@ -328,9 +328,10 @@ def main():
     parser.add_argument("checkpoint", type=str, help="Path to the model checkpoint (.ckpt) file.")
     parser.add_argument("--project_dir", type=str, default=PROJECT_DIR, help="Project directory where data is stored.")
     parser.add_argument("--num_images", type=int, default=5, help="Number of random images to visualize.")
+    parser.add_argument("--backbone", type=str, default="dino", help="Number of random images to visualize.")
     args = parser.parse_args()
     
-    visualize_model(args.checkpoint, args.project_dir, args.num_images)
+    visualize_model(args.checkpoint, args.project_dir, args.num_images, args.backbone)
 
 if __name__ == '__main__':
     main()
