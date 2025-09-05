@@ -1,10 +1,3 @@
-Of course. My apologies for altering that section. I've restored the original project structure description.
-
-Here is the final, complete `README.md` with the corrected results table and the original project structure section.
-
------
-
-````markdown
 # OmniSeg
 
 A versatile, semi-supervised instance segmentation framework built on PyTorch Lightning. OmniSeg enables training with various state-of-the-art backbones and segmentation heads on the COCO dataset. It's designed for flexibility, allowing researchers and developers to easily experiment with different model architectures and training strategies.
@@ -152,6 +145,3 @@ Contributions are welcome\! Feel free to open an issue or submit a pull request 
 Inspired by the **Mean Teacher** methodology.
 
 **Contact:** Ben Harris - [https://doloslabs.com](https://doloslabs.com)
-
-```
-```
