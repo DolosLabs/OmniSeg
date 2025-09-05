@@ -80,7 +80,8 @@ class SSLSegmentationLightning(pl.LightningModule):
         sup_loss = 0.0
         if self.hparams.head_type == 'maskrcnn':
             sup_loss = self._get_sup_loss_mrcnn(pixel_values_l, targets_l)
-        elif self.hparams.head_type in ['contourformer', 'deformable_detr', 'lw_detr']:
+        # MODIFICATION: Add 'sparrow_seg' to the list of DETR-style heads
+        elif self.hparams.head_type in ['contourformer', 'deformable_detr', 'lw_detr', 'sparrow_seg']:
             sup_loss = self._get_sup_loss_detr_style(pixel_values_l, targets_l)
         
         images_u, _ = batch["unlabeled"]
@@ -113,33 +114,23 @@ class SSLSegmentationLightning(pl.LightningModule):
     def validation_step(self, batch: Tuple[torch.Tensor, List[Dict]], batch_idx: int):
         images, targets = batch
         pixel_values = torch.stack([self.val_aug(img, None)[0] for img in images]).to(device=self.device, dtype=self.dtype)
-        batch_size = pixel_values.size(0)
-        # --- MODIFIED SECTION START ---
+        
         # Calculate and log validation loss
-        # Temporarily switch to train mode to get the loss dictionary.
-        # The model's parameters are not updated because we are not calling optimizer.step().
         self.student.train()
         val_loss = 0.0
+        # MODIFICATION: Add 'sparrow_seg' to the list of DETR-style heads for loss calculation
         if self.hparams.head_type == 'maskrcnn':
             val_loss = self._get_sup_loss_mrcnn(pixel_values, targets)
-        elif self.hparams.head_type in ['contourformer', 'deformable_detr', 'lw_detr']:
+        elif self.hparams.head_type in ['contourformer', 'deformable_detr', 'lw_detr', 'sparrow_seg']:
             val_loss = self._get_sup_loss_detr_style(pixel_values, targets)
+        self.student.eval()
         
-        # Switch back to eval mode for inference.
-        self.student.eval() 
-        
-        # log once per epoch (shows in progress bar/metrics)
         self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         
-        # print per batch (rank 0 to avoid DDP spam)
-        if (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0:
-            print(f"[val][batch {batch_idx}] val_loss: {val_loss.item():.4f}")
-
-        # Calculate predictions for mAP metric.
-        # PyTorch Lightning handles the @torch.no_grad() context for validation steps.
+        # Calculate predictions for mAP metric
         outputs = self.student(pixel_values)
         
-        targets_formatted = self._format_targets_for_metric(targets)      
+        targets_formatted = self._format_targets_for_metric(targets)     
         preds = []
         original_sizes = torch.tensor([img.size[::-1] for img in images], device=self.device)
         if self.hparams.head_type == 'maskrcnn':
@@ -150,8 +141,12 @@ class SSLSegmentationLightning(pl.LightningModule):
             preds = self._format_preds_lw_detr(outputs, original_sizes)
         elif self.hparams.head_type == 'contourformer':
             preds = self._format_preds_cf(outputs, original_sizes)
+        # MODIFICATION: Add a case for the new SparrowSegHead
+        elif self.hparams.head_type == 'sparrow_seg':
+            preds = self._format_preds_sparrow_seg(outputs, original_sizes)
         
         self.val_map.update(preds, targets_formatted)
+
 
     def on_validation_epoch_end(self):
         map_dict = self.val_map.compute()
@@ -231,7 +226,56 @@ class SSLSegmentationLightning(pl.LightningModule):
                 'boxes': masks_to_boxes(pred_masks[keep])
             })
         return preds
+        
+    def _format_preds_sparrow_seg(self, outputs, original_sizes):
+        """
+        Formats predictions from SparrowSegHead into the torchmetrics format.
+        This is similar to other DETR-style models but adapted for SparrowSeg's output.
+        """
+        pred_logits, pred_boxes_norm, pred_masks_logits = outputs["pred_logits"], outputs["pred_boxes"], outputs["pred_masks"]
+        results = []
 
+        # Process each image in the batch
+        for i, (h, w) in enumerate(original_sizes):
+            # Convert logits to probabilities and apply a confidence threshold
+            probs = pred_logits[i].softmax(-1)
+            scores, labels = probs.max(-1)
+            keep = scores > 0.1  # Confidence threshold
+
+            scores = scores[keep]
+            labels = labels[keep]
+            boxes_norm = pred_boxes_norm[i][keep]
+            masks_logits = pred_masks_logits[i][keep]
+
+            if scores.numel() == 0:
+                results.append({
+                    "scores": torch.tensor([]), "labels": torch.tensor([]),
+                    "boxes": torch.tensor([]), "masks": torch.tensor([])
+                })
+                continue
+
+            # Convert normalized boxes [cxcywh] to pixel coordinates [xyxy]
+            boxes = box_convert(boxes_norm, in_fmt="cxcywh", out_fmt="xyxy")
+            boxes *= torch.tensor([w, h, w, h], device=boxes.device)
+            
+            # Upsample and binarize masks
+            masks = F.interpolate(
+                masks_logits.unsqueeze(1), 
+                size=(h.item(), w.item()), 
+                mode="bilinear", 
+                align_corners=False
+            ).squeeze(1)
+            masks = (masks.sigmoid() > 0.5).to(torch.uint8)
+
+            results.append({
+                "scores": scores,
+                "labels": labels,
+                "boxes": boxes,
+                "masks": masks
+            })
+            
+        return results
+        
     def _get_sup_loss_detr_style(self, pixel_values, targets):
         targets_detr = []
         h, w = self.hparams.image_size, self.hparams.image_size
