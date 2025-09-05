@@ -6,6 +6,7 @@ from .maskrcnn import MaskRCNNHead
 from .deformable_detr import DETRSegmentationHead
 from .contourformer import ContourFormerHead
 from .lw_detr import LWDETRHead
+from .sparrow_seg import SparrowSegHead
 
 
 def get_head(head_type: str, num_classes: int, **kwargs) -> BaseHead:
@@ -14,7 +15,8 @@ def get_head(head_type: str, num_classes: int, **kwargs) -> BaseHead:
         'maskrcnn': MaskRCNNHead,
         'deformable_detr': DETRSegmentationHead,
         'contourformer': ContourFormerHead,
-        'lw_detr': LWDETRHead
+        'lw_detr': LWDETRHead,
+        'sparrow_seg':SparrowSegHead
     }
     
     if head_type not in head_classes:
@@ -30,5 +32,6 @@ __all__ = [
     'DETRSegmentationHead', 
     'ContourFormerHead',
     'LWDETRSegmentationHead',
+    'SparrowSegHead',
     'get_head'
 ]
