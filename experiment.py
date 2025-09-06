@@ -8,22 +8,24 @@ login()
 
 # Passing backbone-head combinations
 experiments = [
-    ("dino", "maskrcnn"),
+    # ("dino", "maskrcnn"),
     ("dino", "lw_detr"),
     ("dino", "deformable_detr"),
-    ("convnext", "deformable_detr"),
-    ("convnext", "maskrcnn"),
-    ("convnext", "lw_detr"),
-    ("repvgg", "deformable_detr"),
-    ("repvgg", "maskrcnn"),
-    ("repvgg", "lw_detr"),
-    ("resnet", "deformable_detr"),
-    ("resnet", "lw_detr"),
+    ("dino", "sparrow_seg"),
+    #("convnext", "deformable_detr"),
+    # ("convnext", "maskrcnn"),
+    # ("convnext", "lw_detr"),
+    # ("repvgg", "deformable_detr"),
+    # ("repvgg", "maskrcnn"),
+    # ("repvgg", "lw_detr"),
+    # ("resnet", "deformable_detr"),
+    # ("resnet", "lw_detr"),
     ("resnet", "maskrcnn"),
-    ("dino", "sparrow_seg")
+
 ]
 
 RUNS_DIR = "SSL_Instance_Segmentation/runs"
+
 image_size = 128
 
 for backbone, head in experiments:
@@ -90,5 +92,13 @@ for backbone, head in experiments:
     # print(f"\n📊 Running visualization for {backbone}_{head} using {best_ckpt}\n")
 
     # --- Run visualization ---
-    viz_cmd = ["python", "visualize_model.py", best_ckpt,"--backbone",backbone]
+    viz_cmd = ["python", "visualize_model.py", best_ckpt,"--backbone",backbone,"--num_images",str(100)]
     subprocess.run(viz_cmd, check=True)
+gen_stats_cmd = [
+    "python",
+    "./tests/gen_stats.py",
+    VIS_DIR,                   # <-- dynamically parameterized run_dir
+    "--output", "./tests/results.csv",
+    "--plot_dir", "docs"
+]
+subprocess.run(gen_stats_cmd, check=True)
