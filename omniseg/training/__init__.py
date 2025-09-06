@@ -75,7 +75,7 @@ class SSLSegmentationLightning(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         images_l, targets_l = batch["labeled"]
-        pixel_values_l = torch.stack([self.train_aug(img, None)[0] for img in images_l]).to(device=self.device, dtype=self.dtype)
+        pixel_values_l = torch.stack([self.train_aug(img) for img in images_l]).to(device=self.device, dtype=self.dtype)
         batch_size = pixel_values_l.size(0)
         sup_loss = 0.0
         if self.hparams.head_type == 'maskrcnn':
@@ -85,9 +85,10 @@ class SSLSegmentationLightning(pl.LightningModule):
             sup_loss = self._get_sup_loss_detr_style(pixel_values_l, targets_l)
         
         images_u, _ = batch["unlabeled"]
-        pixel_values_u = torch.stack([self.train_aug(img, None)[0] for img in images_u]).to(device=self.device, dtype=self.dtype)
+        pixel_values_u = torch.stack([self.train_aug(img) for img in images_u]).to(device=self.device, dtype=self.dtype)
         
         with torch.no_grad():
+            self.teacher.eval()  # Ensure teacher is in eval mode
             teacher_preds = self.teacher(pixel_values_u)
         
         self.student.eval()
@@ -113,7 +114,7 @@ class SSLSegmentationLightning(pl.LightningModule):
         
     def validation_step(self, batch: Tuple[torch.Tensor, List[Dict]], batch_idx: int):
         images, targets = batch
-        pixel_values = torch.stack([self.val_aug(img, None)[0] for img in images]).to(device=self.device, dtype=self.dtype)
+        pixel_values = torch.stack([self.val_aug(img) for img in images]).to(device=self.device, dtype=self.dtype)
         
         # Calculate and log validation loss
         self.student.train()
