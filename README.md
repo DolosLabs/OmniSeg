@@ -136,7 +136,7 @@ Contributions are welcome\! Feel free to open an issue or submit a pull request 
       - **PyTorch Lightning:** Apache 2.0
       - **Hugging Face Transformers:** Apache 2.0
       - **timm:** Apache 2.0
-      - **DINOv2:** Apache 2.0 (code)
+      - **DINOv3:** Apache 2.0 (code)
       - **Deformable DETR:** Apache 2.0
       - **Mask R-CNN:** MIT License
   - Dataset: **COCO Dataset** (CC-BY 4.0 License)
