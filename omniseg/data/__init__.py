@@ -152,8 +152,7 @@ class SemiCOCODataset(Dataset):
     
         if not masks:
             return self.__getitem__((idx + 1) % len(self))
-    
-        # ✅ FIXED: Wrap the NumPy array of masks in `tv_tensors.Mask`
+
         target = {
             "image_id": torch.tensor([img_id]),
             "labels": torch.tensor(labels, dtype=torch.int64),
@@ -184,7 +183,22 @@ class COCODataModule(pl.LightningDataModule):
     def prepare_data(self):
         """Downloads data if needed. Ran once per node."""
         download_coco2017(root_dir=self.project_dir, splits=['train', 'val', 'test'])
-
+    @staticmethod
+    def collate_fn(batch):
+        """
+        Custom collate function to handle batches of images and targets.
+        Images are stacked into a single tensor, while targets (dictionaries)
+        are gathered into a list.
+        """
+        # Separate images and targets from the batch
+        images = [item[0] for item in batch]
+        targets = [item[1] for item in batch]
+    
+        # Stack images into a single tensor (B, C, H, W)
+        images = torch.stack(images, 0)
+    
+        # Return the batched images and the list of targets
+        return images, targets
     def setup(self, stage=None):
         """Sets up datasets. Ran on each GPU."""
         # MODIFIED: Define transforms here as a best practice
@@ -222,19 +236,21 @@ class COCODataModule(pl.LightningDataModule):
     def train_dataloader(self):
         labeled_loader = DataLoader(
             self.labeled_ds, batch_size=self.batch_size, shuffle=True,
-            num_workers=self.num_workers, pin_memory=True
-            # REMOVED: collate_fn is no longer needed
+            num_workers=self.num_workers, pin_memory=True,
+            collate_fn=self.collate_fn 
         )
         unlabeled_loader = DataLoader(
             self.unlabeled_ds, batch_size=self.batch_size, shuffle=True,
-            num_workers=self.num_workers, pin_memory=True
-            # REMOVED: collate_fn is no longer needed
+            num_workers=self.num_workers, pin_memory=True,
+            collate_fn=self.collate_fn 
         )
         return CombinedLoader({"labeled": labeled_loader, "unlabeled": unlabeled_loader}, mode="max_size_cycle")
 
     def val_dataloader(self):
         return DataLoader(
             self.val_ds, batch_size=1, shuffle=False,
-            num_workers=self.num_workers
-            # REMOVED: collate_fn is no longer needed
+            num_workers=self.num_workers,
+            collate_fn=self.collate_fn 
         )
+        
+
