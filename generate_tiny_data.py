@@ -99,26 +99,32 @@ def generate_shapes_image():
         category_id = next(cat['id'] for cat in CATEGORIES if cat['name']==shape_type)
         color = tuple(random.randint(50,255) for _ in range(3))
 
+        # 1. Create a temporary canvas for the mask FIRST
         shape_canvas = Image.new('L', CANVAS_SIZE, 0)
         shape_draw = ImageDraw.Draw(shape_canvas)
 
+        # 2. Draw the shape ONLY on the temporary canvas
         if shape_type=='circle':
             radius = random.randint(16,32)
-            draw_circle(draw, center, radius, color)
             draw_circle(shape_draw, center, radius, 255)
         elif shape_type=='rectangle':
             width,height = random.randint(16,32), random.randint(16,32)
-            draw_rectangle(draw, center, width, height, color)
             draw_rectangle(shape_draw, center, width, height, 255)
         else: # triangle
             size = random.randint(16,32)
-            draw_triangle(draw, center, size, color)
             draw_triangle(shape_draw, center, size, 255)
 
+        # 3. Create and check the mask from the temporary canvas
         mask_array = np.array(shape_canvas) > 0
         if np.sum(mask_array) < MIN_MASK_PIXELS:
-            continue
+            continue # Skip this shape entirely if it's too small
 
+        # 4. If the mask is valid, NOW draw the shape on the main canvas
+        # We can reuse the mask_array to draw efficiently
+        mask_pil = Image.fromarray(mask_array)
+        canvas.paste(color, mask=mask_pil)
+            
+        # 5. Append the annotation info
         shapes_info.append({
             'category_id': category_id,
             'bbox': get_bbox(mask_array),
