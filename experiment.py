@@ -8,24 +8,24 @@ login()
 
 # Passing backbone-head combinations
 experiments = [
-    # ("dino", "maskrcnn"),
+    ("dino", "maskrcnn"),
     ("dino", "lw_detr"),
     ("dino", "deformable_detr"),
     ("dino", "sparrow_seg"),
     #("convnext", "deformable_detr"),
-    # ("convnext", "maskrcnn"),
-    # ("convnext", "lw_detr"),
-    # ("repvgg", "deformable_detr"),
-    # ("repvgg", "maskrcnn"),
-    # ("repvgg", "lw_detr"),
-    # ("resnet", "deformable_detr"),
-    # ("resnet", "lw_detr"),
+    ("convnext", "maskrcnn"),
+    #("convnext", "lw_detr"),
+     # ("repvgg", "deformable_detr"),
+     ("repvgg", "maskrcnn"),
+     # ("repvgg", "lw_detr"),
+     # ("resnet", "deformable_detr"),
+     # ("resnet", "lw_detr"),
     ("resnet", "maskrcnn"),
 
 ]
 
 RUNS_DIR = "SSL_Instance_Segmentation/runs"
-
+VIS_DIR = "SSL_Instance_Segmentation/visualizations"
 image_size = 128
 
 for backbone, head in experiments:
