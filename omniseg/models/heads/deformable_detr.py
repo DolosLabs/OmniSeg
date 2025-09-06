@@ -340,8 +340,8 @@ class DETRSegmentationHead(BaseHead, nn.Module):
             "loss_ce": 1.0,
             "loss_bbox": 5.0,
             "loss_giou": 2.0,
-            "loss_mask": 1.0,
-            "loss_dice": 1.0,
+            "loss_mask": 5.0,
+            "loss_dice": 2.0,
         }
         
         # Add weights for auxiliary losses if they are ever used
