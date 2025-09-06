@@ -10,12 +10,12 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms.v2 as T
+from torchvision import tv_tensors
 from PIL import Image
 from pycocotools.coco import COCO
 import tqdm
 import pytorch_lightning as pl
 from pytorch_lightning.utilities.combined_loader import CombinedLoader
-
 
 def download_coco2017(root_dir=".", splits=['train', 'val', 'test']):
     """Download COCO 2017 dataset."""
@@ -68,74 +68,108 @@ def get_transforms(augment=False, image_size=224):
     if augment:
         transforms.append(T.RandomHorizontalFlip(p=0.5))
         transforms.append(T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1))
+
     transforms.append(T.Resize((image_size, image_size), antialias=True))
-    transforms.append(T.ToTensor())
+    
+    # --- ✅ CORRECTED CODE ---
+    # 1. Convert PIL Image to a v2 tensor-like Image object
+    transforms.append(T.ToImage()) 
+    # 2. Convert dtype to float and scale values from [0, 255] to [0.0, 1.0]
+    transforms.append(T.ToDtype(torch.float32, scale=True))
+    # -------------------------
+
+    # Now, Normalize receives a tensor as expected.
     transforms.append(T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
+    
     return T.Compose(transforms)
 
+# --- 2. Fixed and Integrated Dataset Class ---
+# This version is corrected to use the transformation pipeline properly.
 
 class SemiCOCODataset(Dataset):
-    """Semi-supervised COCO dataset."""
+    """
+    Semi-supervised COCO dataset that correctly applies v2 transforms.
+    """
     
-    def __init__(self, images_dir, ann_file=None, is_unlabeled=False, num_images=-1):
+    # MODIFIED: Added 'transform=None' to accept the pipeline
+    def __init__(self, images_dir, ann_file=None, is_unlabeled=False, num_images=-1, transform=None):
         self.images_dir = images_dir
         self.is_unlabeled = is_unlabeled
+        self.transform = transform
+        
+        # --- ✅ FIX: Initialize attributes here ---
+        # This ensures they always exist on the object instance.
+        self.coco = None
+        self.cat2label = {}
+        self.label2cat = {}
+        # ----------------------------------------
         
         if self.is_unlabeled:
             self.img_files = [os.path.join(images_dir, f) for f in os.listdir(images_dir) if f.endswith('.jpg')]
             if num_images > 0 and len(self.img_files) > num_images:
                 random.seed(42)
-                random.shuffle(self.img_files)
-                self.img_files = self.img_files[:num_images]
-                print(f"--- Using a random subset of {len(self.img_files)} unlabeled images for training. ---")
+                self.img_files = random.sample(self.img_files, num_images)
+                print(f"--- Using a random subset of {len(self.img_files)} unlabeled images. ---")
         else:
+            # Now, populate the attributes with real data
             self.coco = COCO(ann_file)
             all_img_ids = sorted(self.coco.getImgIds())
             cat_ids = self.coco.getCatIds()
             self.cat2label = {cat_id: i for i, cat_id in enumerate(cat_ids)}
-            self.label2cat = {v: k for k, v in self.cat2label.items()}
+            self.label2cat = {v: k for k, v in self.cat2label.items()} # Now this correctly fills the empty dict
+            
             self.img_ids = [img_id for img_id in all_img_ids if len(self.coco.getAnnIds(imgIds=img_id, iscrowd=False)) > 0]
             if num_images > 0 and len(self.img_ids) > num_images:
                 random.seed(42)
-                random.shuffle(self.img_ids)
-                self.img_ids = self.img_ids[:num_images]
-                print(f"--- Using a random subset of {len(self.img_ids)} labeled images for training. ---")
-    
+                self.img_ids = random.sample(self.img_ids, num_images)
+                print(f"--- Using a random subset of {len(self.img_ids)} labeled images. ---")
+
     def __len__(self):
         return len(self.img_files) if self.is_unlabeled else len(self.img_ids)
-    
+
+    # In your SemiCOCODataset class
     def __getitem__(self, idx):
+        # --- Handle Unlabeled Data ---
         if self.is_unlabeled:
-            return Image.open(self.img_files[idx]).convert("RGB"), {}
-        
+            image = Image.open(self.img_files[idx]).convert("RGB")
+            if self.transform:
+                image, _ = self.transform(image, {})
+            return image, {}
+    
+        # --- Handle Labeled Data ---
         img_id = self.img_ids[idx]
         img_info = self.coco.loadImgs(img_id)[0]
         image = Image.open(os.path.join(self.images_dir, img_info['file_name'])).convert("RGB")
         ann_ids = self.coco.getAnnIds(imgIds=img_id, iscrowd=False)
         anns = self.coco.loadAnns(ann_ids)
-        
+    
         masks, labels = [], []
         for ann in anns:
             mask = self.coco.annToMask(ann)
             if mask.sum() > 0:
                 masks.append(mask)
                 labels.append(self.cat2label[ann['category_id']])
-        
+    
         if not masks:
             return self.__getitem__((idx + 1) % len(self))
-        
+    
+        # ✅ FIXED: Wrap the NumPy array of masks in `tv_tensors.Mask`
         target = {
-            "image_id": img_id, 
-            "labels": torch.tensor(labels, dtype=torch.int64), 
-            "masks": torch.tensor(np.array(masks), dtype=torch.float32)
+            "image_id": torch.tensor([img_id]),
+            "labels": torch.tensor(labels, dtype=torch.int64),
+            "masks": tv_tensors.Mask(np.array(masks, dtype=np.uint8))
         }
+    
+        if self.transform:
+            image, target = self.transform(image, target)
+            
         return image, target
+
 
 
 class COCODataModule(pl.LightningDataModule):
     """COCO data module for PyTorch Lightning."""
-    
-    def __init__(self, project_dir, batch_size=32, num_workers=2, image_size=224, 
+    def __init__(self, project_dir, batch_size=32, num_workers=2, image_size=224,
                  num_labeled_images=-1, num_unlabeled_images=-1):
         super().__init__()
         self.project_dir = project_dir
@@ -144,40 +178,63 @@ class COCODataModule(pl.LightningDataModule):
         self.image_size = image_size
         self.num_labeled_images = num_labeled_images
         self.num_unlabeled_images = num_unlabeled_images
+        
+        # Note: self.train_aug and self.val_aug are now defined in setup()
+
+    def prepare_data(self):
+        """Downloads data if needed. Ran once per node."""
+        download_coco2017(root_dir=self.project_dir, splits=['train', 'val', 'test'])
+
+    def setup(self, stage=None):
+        """Sets up datasets. Ran on each GPU."""
+        # MODIFIED: Define transforms here as a best practice
         self.train_aug = get_transforms(augment=True, image_size=self.image_size)
         self.val_aug = get_transforms(augment=False, image_size=self.image_size)
-    
-    def prepare_data(self):
-        download_coco2017(root_dir=self.project_dir, splits=['train', 'val', 'test'])
-    
-    def setup(self, stage=None):
+        
         base_dir = os.path.join(self.project_dir, 'coco2017')
         train_images_dir = os.path.join(base_dir, 'train2017')
         val_images_dir = os.path.join(base_dir, 'val2017')
-        test_images_dir = os.path.join(base_dir, 'test2017')
+        test_images_dir = os.path.join(base_dir, 'test2017') # Used for unlabeled data
         train_ann_file = os.path.join(base_dir, 'annotations', 'instances_train2017.json')
         val_ann_file = os.path.join(base_dir, 'annotations', 'instances_val2017.json')
+
+        # MODIFIED: Pass the correct transform to each dataset instance
+        self.labeled_ds = SemiCOCODataset(
+            train_images_dir, train_ann_file, 
+            num_images=self.num_labeled_images, 
+            transform=self.train_aug
+        )
+        self.unlabeled_ds = SemiCOCODataset(
+            test_images_dir, is_unlabeled=True, 
+            num_images=self.num_unlabeled_images, 
+            transform=self.train_aug
+        )
+        self.val_ds = SemiCOCODataset(
+            val_images_dir, val_ann_file, 
+            transform=self.val_aug
+        )
         
-        self.labeled_ds = SemiCOCODataset(train_images_dir, train_ann_file, num_images=self.num_labeled_images)
-        self.unlabeled_ds = SemiCOCODataset(test_images_dir, is_unlabeled=True, num_images=self.num_unlabeled_images)
-        self.val_ds = SemiCOCODataset(val_images_dir, val_ann_file)
-        
+        # These assignments remain the same
         self.cat2label = self.labeled_ds.cat2label
         self.label2cat = self.labeled_ds.label2cat
         self.coco_gt_val = self.val_ds.coco
-    
+
     def train_dataloader(self):
-        labeled_loader = DataLoader(self.labeled_ds, batch_size=self.batch_size, shuffle=True, 
-                                   collate_fn=self.collate_fn, num_workers=self.num_workers, 
-                                   pin_memory=True, persistent_workers=False)
-        unlabeled_loader = DataLoader(self.unlabeled_ds, batch_size=self.batch_size, shuffle=True, 
-                                     collate_fn=self.collate_fn, num_workers=self.num_workers, 
-                                     pin_memory=True, persistent_workers=False)
+        labeled_loader = DataLoader(
+            self.labeled_ds, batch_size=self.batch_size, shuffle=True,
+            num_workers=self.num_workers, pin_memory=True
+            # REMOVED: collate_fn is no longer needed
+        )
+        unlabeled_loader = DataLoader(
+            self.unlabeled_ds, batch_size=self.batch_size, shuffle=True,
+            num_workers=self.num_workers, pin_memory=True
+            # REMOVED: collate_fn is no longer needed
+        )
         return CombinedLoader({"labeled": labeled_loader, "unlabeled": unlabeled_loader}, mode="max_size_cycle")
-    
+
     def val_dataloader(self):
-        return DataLoader(self.val_ds, batch_size=1, shuffle=False, collate_fn=self.collate_fn, 
-                         num_workers=self.num_workers, persistent_workers=False)
-    
-    def collate_fn(self, batch):
-        return tuple(zip(*batch))
+        return DataLoader(
+            self.val_ds, batch_size=1, shuffle=False,
+            num_workers=self.num_workers
+            # REMOVED: collate_fn is no longer needed
+        )
