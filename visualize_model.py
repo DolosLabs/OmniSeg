@@ -1,4 +1,5 @@
 import argparse
+import time
 import os
 import random
 import torch
@@ -231,15 +232,24 @@ def visualize_model(checkpoint_path: str, project_dir: str, num_images: int, bac
     colors_list = cmap(np.linspace(0, 1, 80))
     random.shuffle(colors_list)
 
+    inference_times = []
+
     for i, idx in enumerate(indices):
         image_as_tensor, target = val_dataset[idx]
         original_size = image_as_tensor.shape[1:]
         display_image = np.clip(image_as_tensor.permute(1, 2, 0).cpu().numpy(), 0, 1)
         image_tensor = image_as_tensor.unsqueeze(0).to(device)
 
+        # --- Measure inference time ---
+        torch.cuda.synchronize(device) if device.type == "cuda" else None
+        start = time.perf_counter()
         with torch.no_grad():
             raw_outputs = model.student(image_tensor)
-            predictions = process_predictions(model.hparams, raw_outputs, original_size, threshold)
+        torch.cuda.synchronize(device) if device.type == "cuda" else None
+        elapsed = (time.perf_counter() - start) * 1000  # ms
+        inference_times.append(elapsed)
+
+        predictions = process_predictions(model.hparams, raw_outputs, original_size, threshold)
 
         # Plot Original Image
         axes[i, 0].imshow(display_image)
@@ -247,17 +257,15 @@ def visualize_model(checkpoint_path: str, project_dir: str, num_images: int, bac
         axes[i, 0].axis('off')
 
         # Plot Ground Truth
-        # ✅ FIX: Pass the ground truth labels to the drawing function
         gt_preds = {
             "masks": target.get('masks', torch.Tensor()).numpy(),
             "labels": target.get('labels', torch.Tensor()).numpy()
         }
         axes[i, 1].set_title(f"Ground Truth ({len(gt_preds['masks'])} masks)")
-        # We don't have GT boxes/scores, so we pass an empty label_map to avoid drawing text
         draw_predictions(axes[i, 1], display_image, gt_preds, colors_list, {})
 
         # Plot Predictions
-        axes[i, 2].set_title(f"Predictions ({len(predictions['boxes'])} objects @ {threshold} thr)")
+        axes[i, 2].set_title(f"Predictions ({len(predictions['boxes'])} objs @ {threshold} thr)\n{elapsed:.1f} ms")
         draw_predictions(axes[i, 2], display_image, predictions, colors_list, label_map)
 
     plt.tight_layout(pad=1.5)
@@ -265,13 +273,20 @@ def visualize_model(checkpoint_path: str, project_dir: str, num_images: int, bac
     os.makedirs(output_dir, exist_ok=True)
     head_name = model.hparams.get('head_type', 'unknown_head')
     ckpt_name = os.path.splitext(os.path.basename(checkpoint_path))[0]
-    output_path = os.path.join(output_dir, f"{backbone}_{head_name}_predictions_{ckpt_name}.png")
+
+    # --- Add avg inference time to filename ---
+    avg_time = np.mean(inference_times) if inference_times else 0.0
+    output_path = os.path.join(
+        output_dir,
+        f"{backbone}_{head_name}_predictions_{ckpt_name}_{avg_time:.1f}ms.png"
+    )
 
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.show()
 
     print(f"✅ Visualization saved successfully to: {output_path}")
-
+    print(f"📊 Inference times per image (ms): {['%.1f' % t for t in inference_times]}")
+    print(f"📊 Average inference time: {avg_time:.1f} ms")
 # --- Script Entrypoint ---
 
 def main():
