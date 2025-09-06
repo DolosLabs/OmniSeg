@@ -523,7 +523,7 @@ class LWDETRHead(BaseHead, nn.Module):
         matcher = HungarianMatcher(cost_class=1.0, cost_bbox=5.0, cost_giou=2.0)  # Reduced cost_class from 2.0 to 1.0
         
         # Align loss weights with deformable_detr for better convergence
-        weight_dict = {"loss_cls": 1.0, "loss_bbox": 5.0, "loss_giou": 2.0, "loss_mask": 1.0, "loss_dice": 1.0}
+        weight_dict = {"loss_cls": 1.0, "loss_bbox": 5.0, "loss_giou": 2.0, "loss_mask": 5.0, "loss_dice": 2.0}
         
         self.criterion = SetCriterion(self.num_classes, matcher=matcher, weight_dict=weight_dict, eos_coef=0.1)
 
