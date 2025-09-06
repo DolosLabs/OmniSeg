@@ -93,12 +93,10 @@ Here are some sample predictions and performance metrics from different model co
 
 | Backbone | Head | Epochs | Validation mAP | Example Output |
 | :--- | :--- | :--- | :--- | :--- |
-| **ResNet** | Mask R-CNN | 19 | **0.5399** | ![ResNet + Mask R-CNN](docs/resnet_maskrcnn_predictions_best-model-epoch=19-val_mAP=0.5399.png) |
-| **RepVGG** | Mask R-CNN | 17 | **0.5390** | ![RepVGG + Mask R-CNN](docs/repvgg_maskrcnn_predictions_best-model-epoch=17-val_mAP=0.5390.png) |
-| **ConvNeXt** | Mask R-CNN | 48 | **0.5156** | ![ConvNeXt + Mask R-CNN](docs/convnext_maskrcnn_predictions_best-model-epoch=48-val_mAP=0.5156.png) |
-| **DINO** | Deformable DETR | 149 | 0.2605 | ![DINO + Deformable DETR](docs/dino_deformable_detr_predictions_best-model-epoch=149-val_mAP=0.2605.png) |
-| **DINO** | LW-DETR | 139 | 0.1657 | ![DINO + LW-DETR](docs/dino_lw_detr_predictions_best-model-epoch=139-val_mAP=0.1657.png) |
-| **DINO** | Sparrow-Seg | 149 | 0.1569 | ![DINO + Sparrow-Seg](docs/dino_sparrow_seg_predictions_best-model-epoch=149-val_mAP=0.1569.png) |
+| **ResNet** | Mask R-CNN | 19 | **0.5399** | ![ResNet + Mask R-CNN](docs/resnet_maskrcnn_predictions_best-model-epoch=13-val_mAP=0.5475_228.5ms.png) |
+| **DINO** | Deformable DETR | 149 | 0.2605 | ![DINO + Deformable DETR](docs/dino_deformable_detr_predictions_best-model-epoch=129-val_mAP=0.4353_141.9ms.png) |
+| **DINO** | LW-DETR | 139 | 0.1657 | ![DINO + LW-DETR](docs/dino_lw_detr_predictions_best-model-epoch=119-val_mAP=0.3673_192.1ms.png) |
+| **DINO** | Sparrow-Seg | 149 | 0.1569 | ![DINO + Sparrow-Seg](docs/dino_sparrow_seg_predictions_best-model-epoch=79-val_mAP=0.1532_153.6ms.png) |
 
 To generate your own visualizations from a checkpoint:
 
