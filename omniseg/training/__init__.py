@@ -6,25 +6,10 @@ import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional, Any, Union
 
 import pytorch_lightning as pl
-from torchvision.ops import box_convert
+from torchvision.ops import box_convert, masks_to_boxes
 from torchmetrics.detection import MeanAveragePrecision
 
 from ..models.heads.contourformer import masks_to_contours, contours_to_masks
-
-
-def masks_to_boxes(masks: torch.Tensor) -> torch.Tensor:
-    """Computes bounding boxes from masks."""
-    if masks.numel() == 0:
-        return torch.zeros((0, 4), dtype=torch.float32, device=masks.device)
-    n = masks.shape[0]
-    boxes = torch.zeros(n, 4, dtype=masks.dtype, device=masks.device)
-    for i, mask in enumerate(masks):
-        ys, xs = torch.where(mask)
-        if len(xs) == 0:
-            boxes[i] = torch.tensor([0, 0, 1, 1], dtype=masks.dtype, device=masks.device)
-        else:
-            boxes[i] = torch.tensor([xs.min(), ys.min(), xs.max(), ys.max()], dtype=masks.dtype, device=masks.device)
-    return boxes
 
 
 class SSLSegmentationLightning(pl.LightningModule):
@@ -76,7 +61,6 @@ class SSLSegmentationLightning(pl.LightningModule):
                 "monitor": "train_loss_epoch",
             },
         }
-
 
     @torch.no_grad()
     def _update_teacher(self):
@@ -241,15 +225,31 @@ class SSLSegmentationLightning(pl.LightningModule):
     def _format_preds_detr(self, outputs, original_sizes):
         preds = []
         for i in range(outputs['pred_logits'].shape[0]):
-            h, w = original_sizes[i]
-            pred_logits, pred_masks = outputs['pred_logits'][i], outputs['pred_masks'][i]
+            pred_logits, pred_masks_raw = outputs['pred_logits'][i], outputs['pred_masks'][i]
+            
             pred_probs = pred_logits.softmax(-1)[:, :-1]
             pred_scores, pred_labels = pred_probs.max(-1)
-            keep = (pred_scores > 0.05).cpu()
+            
+            keep = pred_scores > 0.05
+            
+            scores = pred_scores[keep]
+            labels = pred_labels[keep]
+            masks_unfiltered = (pred_masks_raw[keep] > 0.5)
+
+            non_empty_indices = [j for j, m in enumerate(masks_unfiltered) if m.any()]
+            if not non_empty_indices:
+                preds.append({'scores': torch.tensor([]), 'labels': torch.tensor([]), 'masks': torch.tensor([]), 'boxes': torch.tensor([])})
+                continue
+
+            final_scores = scores[non_empty_indices]
+            final_labels = labels[non_empty_indices]
+            final_masks = masks_unfiltered[non_empty_indices]
+            
             preds.append({
-                'scores': pred_scores[keep], 'labels': pred_labels[keep],
-                'masks': (pred_masks[keep] > 0.5).to(torch.uint8),
-                'boxes': masks_to_boxes(pred_masks[keep])
+                'scores': final_scores,
+                'labels': final_labels,
+                'masks': final_masks.to(torch.uint8),
+                'boxes': masks_to_boxes(final_masks)
             })
         return preds
         
@@ -258,14 +258,30 @@ class SSLSegmentationLightning(pl.LightningModule):
         for i in range(outputs['pred_logits'].shape[0]):
             h, w = original_sizes[i]
             pred_logits, pred_coords = outputs['pred_logits'][i], outputs['pred_coords'][i]
+            
             pred_probs = pred_logits.softmax(-1)[:, :-1]
             pred_scores, pred_labels = pred_probs.max(-1)
-            pred_masks = contours_to_masks(pred_coords, (h.item(), w.item()))
-            keep = (pred_scores > 0.05).cpu()
+            
+            keep = (pred_scores > 0.05)
+
+            scores = pred_scores[keep]
+            labels = pred_labels[keep]
+            masks_unfiltered = contours_to_masks(pred_coords[keep], (h.item(), w.item()))
+
+            non_empty_indices = [j for j, m in enumerate(masks_unfiltered) if m.any()]
+            if not non_empty_indices:
+                preds.append({'scores': torch.tensor([]), 'labels': torch.tensor([]), 'masks': torch.tensor([]), 'boxes': torch.tensor([])})
+                continue
+                
+            final_scores = scores[non_empty_indices]
+            final_labels = labels[non_empty_indices]
+            final_masks = masks_unfiltered[non_empty_indices]
+
             preds.append({
-                'scores': pred_scores[keep], 'labels': pred_labels[keep],
-                'masks': pred_masks[keep].to(torch.uint8),
-                'boxes': masks_to_boxes(pred_masks[keep])
+                'scores': final_scores,
+                'labels': final_labels,
+                'masks': final_masks.to(torch.uint8),
+                'boxes': masks_to_boxes(final_masks)
             })
         return preds
         
