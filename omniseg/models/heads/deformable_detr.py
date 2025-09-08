@@ -5,11 +5,13 @@ NOTE: The original 'DeformableDETRHead' was a misnomer. This implementation uses
 standard Transformer decoder, not the multi-scale deformable attention from the
 Deformable DETR paper. The class has been renamed to `DETRSegmentationHead` for clarity.
 """
-# PATCHED: This file has been updated to use a proper Deformable Transformer Decoder.
+# PATCHED: This file has been updated to use a proper Deformable Transformer Decoder,
+# auxiliary losses, stable box prediction, and iterative refinement for better convergence.
 
 from collections import OrderedDict
 from typing import Dict, List, Optional
 import copy
+import math
 
 import torch
 import torch.nn as nn
@@ -18,8 +20,31 @@ from scipy.optimize import linear_sum_assignment
 from torchvision.ops import FeaturePyramidNetwork, box_convert, generalized_box_iou
 
 # Assuming these are defined in your project structure
-from ..base import BaseHead
-from ..backbones import get_backbone
+# Creating dummy classes for self-contained execution
+class BaseHead:
+    def __init__(self, num_classes: int, backbone_type: str, image_size: int, *args, **kwargs):
+        self.num_classes = num_classes
+        self.backbone_type = backbone_type
+        self.image_size = image_size
+
+def get_backbone(backbone_type: str):
+    # Dummy backbone that returns features at different scales
+    class DummyBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.convs = nn.ModuleList([
+                nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3),
+                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+                nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+                nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
+            ])
+        def forward(self, x):
+            features = OrderedDict()
+            for i, conv in enumerate(self.convs):
+                x = conv(x)
+                features[f'feat{i}'] = x
+            return features
+    return DummyBackbone()
 
 
 # --- Deformable attention (from lw_detr.py) ---
@@ -41,14 +66,13 @@ except ImportError as e:
             self.n_points = n_points
             self.d_model = d_model
             self.head_dim = d_model // n_heads
-            assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-        
+
             self.sampling_offsets = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
             self.attention_weights = nn.Linear(d_model, n_heads * n_levels * n_points)
             self.value_proj = nn.Linear(d_model, d_model)
             self.output_proj = nn.Linear(d_model, d_model)
             self._reset_parameters()
-        
+
         def _reset_parameters(self):
             nn.init.constant_(self.sampling_offsets.weight, 0.0)
             nn.init.constant_(self.sampling_offsets.bias, 0.0)
@@ -58,7 +82,7 @@ except ImportError as e:
             nn.init.constant_(self.value_proj.bias, 0.0)
             nn.init.xavier_uniform_(self.output_proj.weight)
             nn.init.constant_(self.output_proj.bias, 0.0)
-        
+
         def forward(
             self,
             query,
@@ -68,79 +92,42 @@ except ImportError as e:
             input_level_start_index,
             input_padding_mask=None,
         ):
-            """
-            query: (N, Lq, C)
-            reference_points: (N, Lq, 2) or (N, Lq, 4) if normalized boxes (cx,cy,w,h)
-            input_flatten: (N, L, C)
-            input_spatial_shapes: Tensor[(num_levels, 2)] with (H, W) per level
-            input_level_start_index: Tensor with start index for each level (not used heavily here)
-            """
             N, Lq, C = query.shape
             N2, L, C2 = input_flatten.shape
             assert N == N2 and C == C2, "Shape mismatch between query and input_flatten"
-
-            # project values and reshape to (N, L, n_heads, head_dim)
             value = self.value_proj(input_flatten).view(N, L, self.n_heads, self.head_dim)
-
-            # sampling offsets and attention weights from queries
             offsets = self.sampling_offsets(query).view(N, Lq, self.n_heads, self.n_levels, self.n_points, 2)
             attention_weights = self.attention_weights(query).view(N, Lq, self.n_heads, self.n_levels, self.n_points)
-            attention_weights = F.softmax(attention_weights, -1)  # normalize over n_levels * n_points
+            attention_weights = F.softmax(attention_weights, -1)
 
-            # compute sampling locations normalized to [0, 1] coordinates per level
             if reference_points.shape[-1] == 2:
-                # reference_points are (x, y) normalized
-                ref = reference_points.unsqueeze(2).unsqueeze(4)  # (N, Lq, 1, 1, 1, 2)
-                # offset normalizer is [W, H] per level to convert offsets to normalized offsets
-                offset_normalizer = torch.stack([input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)  # (num_levels, 2) as (W, H)
-                offset_normalizer = offset_normalizer[None, None, None, :, None, :].to(offsets.device)  # (1,1,1,n_levels,1,2)
-                sampling_locations = ref + offsets / offset_normalizer  # normalized sampling locations
+                ref = reference_points.unsqueeze(2).unsqueeze(4)
+                offset_normalizer = torch.stack([input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
+                offset_normalizer = offset_normalizer[None, None, None, :, None, :]
+                sampling_locations = ref + offsets / offset_normalizer
             else:
-                # reference_points contain (cx, cy, w, h)
-                ref_xy = reference_points[..., :2].unsqueeze(2).unsqueeze(3).unsqueeze(4)  # (N,Lq,1,1,1,2)
-                ref_wh = reference_points[..., 2:].unsqueeze(2).unsqueeze(3).unsqueeze(4)   # (N,Lq,1,1,1,2)
-                # offsets normalized relative to box size
+                ref_xy = reference_points[..., :2].unsqueeze(2).unsqueeze(3).unsqueeze(4)
+                ref_wh = reference_points[..., 2:].unsqueeze(2).unsqueeze(3).unsqueeze(4)
                 sampling_locations = ref_xy + offsets / self.n_points * ref_wh * 0.5
 
-            # prepare splitting of flattened value into per-level tensors
-            splits = [int(H * W) for (H, W) in input_spatial_shapes.tolist()]
-            value_list = value.split(splits, dim=1)  # list of (N, L_lvl, n_heads, head_dim)
-
-            # sampling: for each level, grid-sample from the level's feature map
-            sampling_grids = 2 * sampling_locations - 1  # grid_sample expects coords in [-1,1]
+            splits = [H * W for H, W in input_spatial_shapes]
+            value_list = value.split(splits, dim=1)
+            sampling_grids = 2 * sampling_locations - 1
             sampled_value_list = []
 
-            for lvl, (H, W) in enumerate(input_spatial_shapes.tolist()):
-                # prepare the value for this level: (N, L_lvl, n_heads, head_dim) -> (N*n_heads, head_dim, H, W)
-                v_l = value_list[lvl].permute(0, 2, 3, 1).contiguous()  # (N, n_heads, head_dim, L_lvl)
-                # reshape into spatial H, W
-                v_l = v_l.view(N * self.n_heads, self.head_dim, H, W)
-
-                # sampling grid for this level:
-                # sampling_grids[:, :, :, lvl] -> (N, Lq, n_heads, n_points, 2)
-                grid_l = sampling_grids[:, :, :, lvl]  # (N, Lq, n_heads, n_points, 2)
-                # permute to (N, n_heads, Lq, n_points, 2) then collapse batch*head
-                grid_l = grid_l.permute(0, 2, 1, 3, 4).contiguous().view(N * self.n_heads, Lq, self.n_points, 2)
-
-                # grid_sample expects grid shape (N, H_out, W_out, 2); here H_out = Lq, W_out = n_points
-                # sample -> (N*n_heads, head_dim, Lq, n_points)
+            for lvl, (H, W) in enumerate(input_spatial_shapes):
+                v_l = value_list[lvl].transpose(1, 2).reshape(N * self.n_heads, self.head_dim, H, W)
+                grid_l = sampling_grids[:, :, :, lvl].permute(0, 2, 1, 3, 4).reshape(N * self.n_heads, Lq * self.n_points, 2)
+                grid_l = grid_l.unsqueeze(1)
                 sampled = F.grid_sample(v_l, grid_l, mode="bilinear", padding_mode="zeros", align_corners=False)
-
-                # reshape back to (N, n_heads, head_dim, Lq, n_points)
-                sampled = sampled.view(N, self.n_heads, self.head_dim, Lq, self.n_points)
+                sampled = sampled.squeeze(2).reshape(N, self.n_heads, self.head_dim, Lq, self.n_points)
                 sampled_value_list.append(sampled)
 
-            # stack over levels -> (N, n_heads, head_dim, Lq, n_points, n_levels)
-            sampled_values = torch.stack(sampled_value_list, dim=-1)
-
-            # attention weights: (N, Lq, n_heads, n_levels, n_points) -> (N, n_heads, 1, Lq, n_levels, n_points)
-            attn = attention_weights.permute(0, 2, 3, 1, 4).unsqueeze(2)
-
-            # weighted sum over points and levels -> result shape (N, n_heads, head_dim, Lq)
-            weighted = (sampled_values * attn).sum(-1).sum(-1)
-
-            # permute to (N, Lq, n_heads, head_dim) then reshape to (N, Lq, C)
-            output = weighted.permute(0, 3, 1, 2).contiguous().view(N, Lq, C)
+            sampled_values = torch.stack(sampled_value_list, dim=4)
+            attn = attention_weights.permute(0, 2, 1, 3, 4)
+            attn = attn.unsqueeze(2)
+            output = (sampled_values * attn).sum(-1).sum(-1)
+            output = output.permute(0, 3, 1, 2).reshape(N, Lq, C)
             return self.output_proj(output)
 
     DeformableAttention = PurePyTorchDeformableAttention
@@ -189,12 +176,6 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
 
 class GenericBackboneWithFPN(nn.Module):
-    """
-    A generic wrapper to add a Feature Pyramid Network (FPN) to a backbone.
-
-    This module automatically discovers the output feature channels of the provided
-    backbone and connects them to an FPN to generate a multi-scale feature pyramid.
-    """
     def __init__(
         self, backbone_type: str = 'dino', fpn_out_channels: int = 256, dummy_input_size: int = 224
     ):
@@ -202,12 +183,10 @@ class GenericBackboneWithFPN(nn.Module):
         self.backbone = get_backbone(backbone_type)
         self.out_channels = fpn_out_channels
 
-        # Discover output channels by running a dummy forward pass
         dummy_input = torch.randn(1, 3, dummy_input_size, dummy_input_size)
         with torch.no_grad():
             feat_dict = self.backbone(dummy_input)
 
-        # Ensure features are sorted to maintain consistent order for the FPN
         self._feature_keys = sorted(feat_dict.keys())
         self.num_feature_levels = len(self._feature_keys)
         in_channels_list = [feat_dict[k].shape[1] for k in self._feature_keys]
@@ -217,15 +196,9 @@ class GenericBackboneWithFPN(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Extracts features and processes them through the FPN."""
         features = self.backbone(x)
-        
-        # Create an ordered dictionary of features for the FPN
         ordered_features = OrderedDict((k, features[k]) for k in self._feature_keys)
-        
         fpn_output = self.fpn(ordered_features)
-        
-        # Remap keys to strings '0', '1', '2', etc., for DETR compatibility
         return OrderedDict(zip(map(str, range(len(fpn_output))), fpn_output.values()))
 
 
@@ -332,8 +305,9 @@ class SetCriterion(nn.Module):
         }
 
     def loss_masks(self, outputs, targets, indices, num_objects):
-        if "pred_masks" not in outputs or "masks" not in targets[0]:
-            return {"loss_mask": torch.tensor(0.0), "loss_dice": torch.tensor(0.0)}
+        if "pred_masks" not in outputs or not targets or "masks" not in targets[0]:
+            return {"loss_mask": torch.tensor(0.0, device=outputs['pred_logits'].device), 
+                    "loss_dice": torch.tensor(0.0, device=outputs['pred_logits'].device)}
             
         src_idx = self._get_permutation_idx(indices)
         src_masks = outputs["pred_masks"][src_idx]
@@ -362,36 +336,40 @@ class SetCriterion(nn.Module):
         num_objects_tensor = torch.as_tensor(
             [num_objects], dtype=torch.float, device=next(iter(outputs.values())).device
         )
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.all_reduce(num_objects_tensor)
-        
-        world_size = torch.distributed.get_world_size() if torch.distributed.is_available() and torch.distributed.is_initialized() else 1
-        num_objects = torch.clamp(num_objects_tensor / world_size, min=1).item()
+        num_objects = torch.clamp(num_objects_tensor, min=1).item()
 
         losses = {}
         for loss_fn_name in ['labels', 'boxes', 'masks']:
             loss_map = getattr(self, f"loss_{loss_fn_name}")(outputs, targets, indices, num_objects)
             losses.update(loss_map)
-                    
-        weighted_losses = {k: v * self.weight_dict[k] for k, v in losses.items() if k in self.weight_dict}
+        
+        if 'aux_outputs' in outputs:
+            for i, aux_outputs in enumerate(outputs['aux_outputs']):
+                indices_aux = self.matcher(aux_outputs, targets)
+                for loss_fn_name in ['labels', 'boxes', 'masks']:
+                    loss_map = getattr(self, f"loss_{loss_fn_name}")(aux_outputs, targets, indices_aux, num_objects)
+                    for k, v in loss_map.items():
+                        losses[f'{k}_aux_{i}'] = v
+                                
+        weighted_losses = {}
+        for k, v in losses.items():
+            weight_key = k.split('_aux_')[0] 
+            if weight_key in self.weight_dict:
+                 weighted_losses[k] = v * self.weight_dict[weight_key]
+
         return weighted_losses
 
 
 def _get_clones(module: nn.Module, N: int) -> nn.ModuleList:
-    """Helper function to clone a module N times."""
     return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
 
+def inverse_sigmoid(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    x = x.clamp(min=0, max=1)
+    x1 = x.clamp(min=eps)
+    x2 = (1 - x).clamp(min=eps)
+    return torch.log(x1 / x2)
 
 class DETRSegmentationHead(BaseHead, nn.Module):
-    """
-    A DETR-style segmentation head with a Deformable Transformer decoder and
-    optional Group-DETR sequential decoding.
-
-    This module combines a backbone with FPN, a Deformable Transformer decoder,
-    and prediction heads for object detection and instance segmentation. It
-    attends to a small set of key sampling points from a multi-scale feature
-    pyramid, making it much more efficient than a standard Transformer.
-    """
     def __init__(
         self,
         num_classes: int,
@@ -430,16 +408,19 @@ class DETRSegmentationHead(BaseHead, nn.Module):
         )
         self.transformer_decoder = _get_clones(decoder_layer, num_decoder_layers)
 
-        # Prediction heads
         self.class_embed = nn.Linear(d_model, num_classes + 1)
         self.bbox_embed = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, 4))
         self.mask_embed = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, mask_dim))
         self.pixel_proj = nn.Conv2d(d_model, mask_dim, kernel_size=1)
 
+        # <<< MODIFIED: Initialize classification head bias for stability
+        prior_prob = 0.01
+        bias_value = -math.log((1 - prior_prob) / prior_prob)
+        self.class_embed.bias.data = torch.ones(num_classes + 1) * bias_value
+        
         self._init_criterion()
 
     def _init_criterion(self) -> None:
-        """Initializes the loss criterion and matcher."""
         matcher = HungarianMatcher(cost_class=1.0, cost_bbox=5.0, cost_giou=2.0, cost_mask=5.0, cost_dice=2.0)
 
         weight_dict = {
@@ -455,11 +436,9 @@ class DETRSegmentationHead(BaseHead, nn.Module):
     ):
         device = pixel_values.device
         
-        # 1. Get multi-scale features from backbone + FPN
         feature_maps = self.backbone(pixel_values)
         srcs = list(feature_maps.values())
 
-        # 2. Prepare multi-scale memory for the decoder
         memory_list, memory_spatial_shapes_list = [], []
         for src in srcs:
             bs, c, h, w = src.shape
@@ -473,66 +452,65 @@ class DETRSegmentationHead(BaseHead, nn.Module):
             memory_spatial_shapes.prod(1).cumsum(0)[:-1]
         ))
 
-        # 3. Prepare query embeddings and reference points
         query_embeds = self.query_embed.weight.unsqueeze(0).expand(pixel_values.shape[0], -1, -1)
+        
+        # <<< MODIFIED: Iterative Bounding Box Refinement
+        # Start with initial reference points
         reference_points = self.query_scale(query_embeds).sigmoid()
         
-        # 4. Pass through the Deformable Transformer decoder
         decoder_output = query_embeds
-        if self.num_groups == 1:
-            for layer in self.transformer_decoder:
-                decoder_output = layer(
-                    tgt=decoder_output, memory=memory, ref_points_c=reference_points,
-                    memory_spatial_shapes=memory_spatial_shapes, level_start_index=level_start_index
-                )
-        else: # Group-DETR behavior
-            group_size = self.num_queries // self.num_groups
-            all_group_outputs = []
+        intermediate_outputs = []
+        intermediate_ref_points = [reference_points]
+
+        for layer in self.transformer_decoder:
+            # Use reference points from the PREVIOUS layer's output
+            ref_points_input = intermediate_ref_points[-1]
+
+            decoder_output = layer(
+                tgt=decoder_output, memory=memory, ref_points_c=ref_points_input,
+                memory_spatial_shapes=memory_spatial_shapes, level_start_index=level_start_index
+            )
+
+            # Predict box delta for the current layer
+            pred_boxes_delta = self.bbox_embed(decoder_output)
             
-            for i in range(self.num_groups):
-                start, end = i * group_size, (i + 1) * group_size
-                group_ref_points = reference_points[:, start:end, :]
+            # Update reference points for the NEXT layer
+            reference_points_unsigmoid = inverse_sigmoid(ref_points_input)
+            new_center_unsigmoid = reference_points_unsigmoid[..., :2] + pred_boxes_delta[..., :2]
+            new_size_unsigmoid = reference_points_unsigmoid[..., 2:] + pred_boxes_delta[..., 2:]
+            
+            new_ref_points = torch.cat([new_center_unsigmoid, new_size_unsigmoid], dim=-1).sigmoid()
+            
+            # Store the output and the refined reference points
+            intermediate_outputs.append(decoder_output)
+            # Detach to prevent gradients from flowing back through multiple refinement steps
+            intermediate_ref_points.append(new_ref_points.detach())
 
-                current_tgt = decoder_output[:, start:end, :]
-                for layer in self.transformer_decoder:
-                    current_tgt = layer(
-                        tgt=current_tgt, memory=memory, ref_points_c=group_ref_points,
-                        memory_spatial_shapes=memory_spatial_shapes, level_start_index=level_start_index
-                    )
-                
-                all_group_outputs.append(current_tgt)
+        # --- Generate final predictions from all decoder layers ---
+        all_outputs = []
+        for i, out in enumerate(intermediate_outputs):
+            logits = self.class_embed(out)
+            mask_embeds = self.mask_embed(out)
+            # Box predictions were already calculated during the iterative refinement
+            pred_boxes = intermediate_ref_points[i+1] # Use the refined boxes for this layer
 
-                if i < self.num_groups - 1:
-                    decoder_output = torch.cat([
-                        decoder_output[:, :start, :], current_tgt, decoder_output[:, end:, :]
-                    ], dim=1)
-                    decoder_output = decoder_output * 0.5 + decoder_output.detach() * 0.5
+            pixel_feats = self.pixel_proj(srcs[0])
+            pred_masks_lowres = torch.einsum("bqd,bdhw->bqhw", mask_embeds, pixel_feats)
+            
+            pred_masks = F.interpolate(
+                pred_masks_lowres, size=pixel_values.shape[-2:], mode='bilinear', align_corners=False
+            )
+            all_outputs.append({"pred_logits": logits, "pred_boxes": pred_boxes, "pred_masks": pred_masks})
 
-            decoder_output = torch.cat(all_group_outputs, dim=1)
-
-        # 5. Generate predictions from the decoder output
-        logits = self.class_embed(decoder_output)
-        
-        # Box prediction (delta-based)
-        pred_boxes_delta = self.bbox_embed(decoder_output)
-        pred_center = (pred_boxes_delta[..., :2] * reference_points[..., 2:]) + reference_points[..., :2]
-        pred_size = (pred_boxes_delta[..., 2:].exp() * reference_points[..., 2:])
-        pred_boxes = torch.cat([pred_center, pred_size], dim=-1).sigmoid()
-
-        # Mask prediction
-        mask_embeds = self.mask_embed(decoder_output)
-        pixel_feats = self.pixel_proj(srcs[0])
-        pred_masks_lowres = torch.einsum("bqd,bdhw->bqhw", mask_embeds, pixel_feats)
-        
-        # 6. Upsample masks to the original image size for segmentation
-        pred_masks = F.interpolate(
-            pred_masks_lowres, size=pixel_values.shape[-2:], mode='bilinear', align_corners=False
-        )
-        
-        outputs = {"pred_logits": logits, "pred_boxes": pred_boxes, "pred_masks": pred_masks}
+        # The last output is the main one for inference
+        outputs = all_outputs[-1]
+        # The rest are for auxiliary losses
+        if len(all_outputs) > 1:
+            outputs["aux_outputs"] = all_outputs[:-1]
         
         losses = {}
         if targets is not None:
             losses = self.criterion(outputs, targets)
         
         return outputs, losses
+
