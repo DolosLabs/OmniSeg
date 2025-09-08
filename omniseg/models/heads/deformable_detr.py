@@ -394,7 +394,6 @@ class DETRSegmentationHead(BaseHead, nn.Module):
         self.mask_embed = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, mask_dim))
         self.pixel_proj = nn.Conv2d(d_model, mask_dim, kernel_size=1)
 
-        # <<< MODIFIED: Initialize classification head bias for stability
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
         self.class_embed.bias.data = torch.ones(num_classes + 1) * bias_value
@@ -403,11 +402,9 @@ class DETRSegmentationHead(BaseHead, nn.Module):
 
     def _init_criterion(self) -> None:
         matcher = HungarianMatcher(cost_class=1.0, cost_bbox=5.0, cost_giou=2.0, cost_mask=5.0, cost_dice=2.0)
-
         weight_dict = {
             "loss_cls": 1.0, "loss_bbox": 5.0, "loss_giou": 2.0, "loss_mask": 5.0, "loss_dice": 2.0
         }
-        
         self.criterion = SetCriterion(
             self.num_classes, matcher=matcher, weight_dict=weight_dict, eos_coef=0.1,
         )
@@ -435,8 +432,6 @@ class DETRSegmentationHead(BaseHead, nn.Module):
 
         query_embeds = self.query_embed.weight.unsqueeze(0).expand(pixel_values.shape[0], -1, -1)
         
-        # <<< MODIFIED: Iterative Bounding Box Refinement
-        # Start with initial reference points
         reference_points = self.query_scale(query_embeds).sigmoid()
         
         decoder_output = query_embeds
@@ -444,7 +439,6 @@ class DETRSegmentationHead(BaseHead, nn.Module):
         intermediate_ref_points = [reference_points]
 
         for layer in self.transformer_decoder:
-            # Use reference points from the PREVIOUS layer's output
             ref_points_input = intermediate_ref_points[-1]
 
             decoder_output = layer(
@@ -452,30 +446,29 @@ class DETRSegmentationHead(BaseHead, nn.Module):
                 memory_spatial_shapes=memory_spatial_shapes, level_start_index=level_start_index
             )
 
-            # Predict box delta for the current layer
             pred_boxes_delta = self.bbox_embed(decoder_output)
             
-            # Update reference points for the NEXT layer
             reference_points_unsigmoid = inverse_sigmoid(ref_points_input)
             new_center_unsigmoid = reference_points_unsigmoid[..., :2] + pred_boxes_delta[..., :2]
             new_size_unsigmoid = reference_points_unsigmoid[..., 2:] + pred_boxes_delta[..., 2:]
             
             new_ref_points = torch.cat([new_center_unsigmoid, new_size_unsigmoid], dim=-1).sigmoid()
             
-            # Store the output and the refined reference points
             intermediate_outputs.append(decoder_output)
-            # Detach to prevent gradients from flowing back through multiple refinement steps
             intermediate_ref_points.append(new_ref_points.detach())
 
         # --- Generate final predictions from all decoder layers ---
         all_outputs = []
+        
+        # <<< FIX 3: Avoid redundant computation by projecting pixel features only once.
+        pixel_feats = self.pixel_proj(srcs[0])
+        
         for i, out in enumerate(intermediate_outputs):
             logits = self.class_embed(out)
             mask_embeds = self.mask_embed(out)
-            # Box predictions were already calculated during the iterative refinement
-            pred_boxes = intermediate_ref_points[i+1] # Use the refined boxes for this layer
+            pred_boxes = intermediate_ref_points[i+1] 
 
-            pixel_feats = self.pixel_proj(srcs[0])
+            # Use the pre-computed pixel_feats
             pred_masks_lowres = torch.einsum("bqd,bdhw->bqhw", mask_embeds, pixel_feats)
             
             pred_masks = F.interpolate(
@@ -483,9 +476,7 @@ class DETRSegmentationHead(BaseHead, nn.Module):
             )
             all_outputs.append({"pred_logits": logits, "pred_boxes": pred_boxes, "pred_masks": pred_masks})
 
-        # The last output is the main one for inference
         outputs = all_outputs[-1]
-        # The rest are for auxiliary losses
         if len(all_outputs) > 1:
             outputs["aux_outputs"] = all_outputs[:-1]
         
