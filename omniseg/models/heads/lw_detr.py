@@ -311,8 +311,10 @@ class HungarianMatcher(nn.Module):
         if "pred_masks" in outputs and "masks" in targets[0]:
             out_masks = outputs["pred_masks"].flatten(0, 1)
             tgt_masks = torch.cat([v["masks"] for v in targets], dim=0)
+            # Convert boolean masks to float for interpolation
+            tgt_masks = tgt_masks.float()
             tgt_masks = F.interpolate(tgt_masks.unsqueeze(1), size=out_masks.shape[-2:], mode="bilinear", align_corners=False).squeeze(1)
-            out_flat, tgt_flat = out_masks.sigmoid().flatten(1), tgt_masks.float().flatten(1)
+            out_flat, tgt_flat = out_masks.sigmoid().flatten(1), tgt_masks.flatten(1)
 
             numerator = 2 * (out_flat @ tgt_flat.T)
             denominator = out_flat.sum(-1)[:, None] + tgt_flat.sum(-1)[None, :]
@@ -419,6 +421,9 @@ class SetCriterion(nn.Module):
         src_masks = outputs["pred_masks"][src_idx]
         
         target_masks = torch.cat([t['masks'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        
+        # Convert boolean masks to float for interpolation and loss computation
+        target_masks = target_masks.float()
         
         # Resize target masks to match predicted mask size
         target_masks_resized = F.interpolate(
