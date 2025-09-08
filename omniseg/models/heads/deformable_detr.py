@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from torchvision.ops import FeaturePyramidNetwork, box_convert, generalized_box_iou
 
+from ..backbones import get_backbone  # project-specific
 # Assuming these are defined in your project structure
 # Creating dummy classes for self-contained execution
 class BaseHead:
@@ -26,26 +27,6 @@ class BaseHead:
         self.num_classes = num_classes
         self.backbone_type = backbone_type
         self.image_size = image_size
-
-def get_backbone(backbone_type: str):
-    # Dummy backbone that returns features at different scales
-    class DummyBackbone(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.convs = nn.ModuleList([
-                nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3),
-                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-                nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
-                nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
-            ])
-        def forward(self, x):
-            features = OrderedDict()
-            for i, conv in enumerate(self.convs):
-                x = conv(x)
-                features[f'feat{i}'] = x
-            return features
-    return DummyBackbone()
-
 
 # --- Deformable attention (from lw_detr.py) ---
 try:
@@ -513,4 +494,3 @@ class DETRSegmentationHead(BaseHead, nn.Module):
             losses = self.criterion(outputs, targets)
         
         return outputs, losses
-
