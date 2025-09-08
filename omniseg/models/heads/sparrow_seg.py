@@ -361,10 +361,13 @@ class SparrowSegHead(BaseHead, nn.Module):
 
         outputs = {"pred_logits": logits, "pred_boxes": pred_boxes, "pred_masks": pred_masks}
 
-        if self.training and targets is not None:
+        losses = {}
+        if targets is not None:
+            # The criterion calculates all the losses and returns a dictionary
             losses = self.criterion(outputs, targets)
-            return outputs, losses
-        return outputs
+
+        # Always return both outputs and the (potentially empty) losses dictionary
+        return outputs, losses
 
 # --- Example Usage ---
 if __name__ == '__main__':
