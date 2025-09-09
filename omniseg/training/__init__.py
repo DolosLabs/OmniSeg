@@ -129,10 +129,16 @@ class SSLSegmentationLightning(pl.LightningModule):
         with torch.no_grad():
             if self.hparams.head_type == 'maskrcnn':
                 self.student.train()
-                val_loss_dict = self.student(pixel_values, self._prepare_mrcnn_targets(targets))
+                # The model now returns a tuple: (predictions, losses).
+                # In training mode, our workaround returns (loss_dict, loss_dict).
+                # We only need the second element here for the loss values.
+                _, val_loss_dict = self.student(pixel_values, self._prepare_mrcnn_targets(targets))
                 val_loss = sum(val_loss_dict.values())
+                
                 self.student.eval()
-                outputs = self.student(pixel_values)
+                # In eval mode, the model returns (predictions, {}).
+                # We only need the first element here for the output predictions.
+                outputs, _ = self.student(pixel_values)
             else:
                 targets_detr = self._prepare_detr_targets(targets)
                 outputs, val_losses_dict = self.student(pixel_values=pixel_values, targets=targets_detr)
@@ -167,40 +173,108 @@ class SSLSegmentationLightning(pl.LightningModule):
         
         _, sup_losses_dict = self.student(pixel_values=pixel_values, targets=targets_detr)
         return sum(sup_losses_dict.values())
+    # In your SSLSegmentationLightning class...
+
     def _get_unsup_loss_detr(self, strong_images: torch.Tensor, pseudo_targets: List[Dict]) -> torch.Tensor:
         self.student.train()
-        _, unsup_losses_dict = self.student(pixel_values=strong_images, targets=pseudo_targets)
+        
+        # ============================ START: FINAL ROBUSTNESS FIX ============================
+        final_pseudo_targets = []
+        device = strong_images.device
+    
+        for target in pseudo_targets:
+            boxes = target.get("boxes")
+            
+            # Assume pseudo-labels are in xyxy format for this check
+            if boxes is not None and boxes.shape[0] > 0:
+                valid_indices = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+                
+                # CASE 1: The image has at least one valid pseudo-label box.
+                if valid_indices.any():
+                    # Filter the target dictionary to keep only the valid entries.
+                    new_target = {key: value[valid_indices] for key, value in target.items()}
+                    final_pseudo_targets.append(new_target)
+                    continue # Move to the next target
+            
+            # CASE 2: The image has no boxes or no valid boxes.
+            # Append an "empty" target to maintain the 1-to-1 correspondence.
+            final_pseudo_targets.append({
+                "boxes": torch.empty((0, 4), dtype=torch.float32, device=device),
+                "labels": torch.empty(0, dtype=torch.long, device=device),
+                "masks": torch.empty(0, self.hparams.image_size, self.hparams.image_size, device=device) 
+                # Adjust mask shape if needed, this is a common default.
+            })
+            
+        # If for some reason the whole batch is empty (should not happen if batch_size > 0),
+        # return a zero loss to be safe.
+        if not final_pseudo_targets:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # Now, `strong_images` and `final_pseudo_targets` will always have the same length.
+        _, unsup_losses_dict = self.student(pixel_values=strong_images, targets=final_pseudo_targets)
+        # ============================= END: FINAL ROBUSTNESS FIX =============================
+        
         return sum(unsup_losses_dict.values())
     
-    # --- Helper functions below are unchanged ---
 
     def _get_sup_loss_mrcnn(self, pixel_values: torch.Tensor, targets: List[Dict]) -> torch.Tensor:
         targets_mrcnn = self._prepare_mrcnn_targets(targets)
-        losses_sup = self.student(pixel_values, targets_mrcnn)
-        return sum(losses_sup.values())
+        # The model returns a (predictions, losses) tuple.
+        # We only need the second element, which contains the loss dictionary.
+        _, losses_sup_dict = self.student(pixel_values, targets_mrcnn)
+        return sum(losses_sup_dict.values())
     
-    def _create_pseudo_targets(self, preds: Dict, conf_thresh: float) -> List[Dict]:
+    def _create_pseudo_targets(self, preds: Union[Dict, List[Dict]], conf_thresh: float) -> List[Dict]:
         pseudo_targets = []
-        logits, boxes_cxcywh, masks_logits = preds['pred_logits'], preds['pred_boxes'], preds['pred_masks']
-
-        for i in range(logits.shape[0]):
-            probs = logits[i].softmax(-1)[:, :-1]
-            scores, labels = probs.max(-1)
-            keep = scores > conf_thresh
-
-            if not keep.any():
+    
+        # CASE 1: Handle DETR-style output (a single dictionary of batched tensors)
+        if isinstance(preds, dict):
+            logits, boxes_cxcywh, masks_logits = preds['pred_logits'], preds['pred_boxes'], preds['pred_masks']
+            for i in range(logits.shape[0]): # Iterate over batch
+                probs = logits[i].softmax(-1)[:, :-1]
+                scores, labels = probs.max(-1)
+                keep = scores > conf_thresh
+    
+                if not keep.any():
+                    pseudo_targets.append({
+                        "labels": torch.tensor([], dtype=torch.long, device=self.device),
+                        "boxes": torch.tensor([], device=self.device),
+                        "masks": torch.tensor([], device=self.device)
+                    })
+                    continue
+    
                 pseudo_targets.append({
-                    "labels": torch.tensor([], dtype=torch.long, device=self.device),
-                    "boxes": torch.tensor([], device=self.device),
-                    "masks": torch.tensor([], device=self.device)
+                    "labels": labels[keep].detach(),
+                    "boxes": boxes_cxcywh[i][keep].detach(),
+                    "masks": (masks_logits[i][keep].sigmoid() > 0.5).float().detach()
                 })
-                continue
-
-            pseudo_targets.append({
-                "labels": labels[keep].detach(),
-                "boxes": boxes_cxcywh[i][keep].detach(),
-                "masks": (masks_logits[i][keep].sigmoid() > 0.5).float().detach()
-            })
+    
+        # CASE 2: Handle Mask R-CNN-style output (a list of dictionaries)
+        elif isinstance(preds, list):
+            h, w = self.hparams.image_size, self.hparams.image_size
+            for pred_dict in preds: # Iterate over predictions for each image
+                keep = pred_dict['scores'] > conf_thresh
+    
+                if not keep.any():
+                    pseudo_targets.append({
+                        "labels": torch.tensor([], dtype=torch.long, device=self.device),
+                        "boxes": torch.tensor([], device=self.device),
+                        "masks": torch.tensor([], device=self.device)
+                    })
+                    continue
+                
+                # The unsupervised loss expects DETR format, so we must convert the boxes
+                boxes_xyxy = pred_dict['boxes'][keep]
+                boxes_cxcywh = box_convert(boxes_xyxy, in_fmt="xyxy", out_fmt="cxcywh")
+                boxes_cxcywh[:, 0::2] /= w
+                boxes_cxcywh[:, 1::2] /= h
+                
+                pseudo_targets.append({
+                    "labels": pred_dict['labels'][keep].detach(),
+                    "boxes": boxes_cxcywh.detach(),
+                    "masks": (pred_dict['masks'][keep] > 0.5).squeeze(1).float().detach()
+                })
+                
         return pseudo_targets
 
     def _prepare_detr_targets(self, targets: List[Dict]) -> List[Dict]:
