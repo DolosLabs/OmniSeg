@@ -165,62 +165,73 @@ class SSLSegmentationLightning(pl.LightningModule):
         self.val_map.reset()
 
     def _get_sup_loss_detr(self, pixel_values: torch.Tensor, targets: List[Dict]) -> torch.Tensor:
-        # ============================ THIS IS THE FIX ============================
-        # The raw targets are passed to this function. We must first process them
-        # to compute and add the 'boxes' key before sending them to the model.
-        targets_detr = self._prepare_detr_targets(targets)
-        # =======================================================================
+        """Compute supervised loss for DETR-style models.
         
+        Args:
+            pixel_values: Input images tensor
+            targets: Raw target annotations that need preprocessing
+            
+        Returns:
+            Total supervised loss
+        """
+        targets_detr = self._prepare_detr_targets(targets)
         _, sup_losses_dict = self.student(pixel_values=pixel_values, targets=targets_detr)
         return sum(sup_losses_dict.values())
-    # In your SSLSegmentationLightning class...
 
     def _get_unsup_loss_detr(self, strong_images: torch.Tensor, pseudo_targets: List[Dict]) -> torch.Tensor:
+        """Compute unsupervised loss for DETR-style models.
+        
+        Args:
+            strong_images: Strongly augmented images tensor
+            pseudo_targets: Pseudo-labels from teacher model
+            
+        Returns:
+            Total unsupervised loss
+        """
         self.student.train()
         
-        # ============================ START: FINAL ROBUSTNESS FIX ============================
+        # Filter pseudo-targets to remove invalid boxes
         final_pseudo_targets = []
         device = strong_images.device
     
         for target in pseudo_targets:
             boxes = target.get("boxes")
             
-            # Assume pseudo-labels are in xyxy format for this check
             if boxes is not None and boxes.shape[0] > 0:
+                # Keep only valid boxes (x2 > x1 and y2 > y1)
                 valid_indices = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
                 
-                # CASE 1: The image has at least one valid pseudo-label box.
                 if valid_indices.any():
-                    # Filter the target dictionary to keep only the valid entries.
+                    # Filter target to keep only valid entries
                     new_target = {key: value[valid_indices] for key, value in target.items()}
                     final_pseudo_targets.append(new_target)
-                    continue # Move to the next target
+                    continue
             
-            # CASE 2: The image has no boxes or no valid boxes.
-            # Append an "empty" target to maintain the 1-to-1 correspondence.
+            # Create empty target for images with no valid boxes
             final_pseudo_targets.append({
                 "boxes": torch.empty((0, 4), dtype=torch.float32, device=device),
                 "labels": torch.empty(0, dtype=torch.long, device=device),
-                "masks": torch.empty(0, self.hparams.image_size, self.hparams.image_size, device=device) 
-                # Adjust mask shape if needed, this is a common default.
+                "masks": torch.empty(0, self.hparams.image_size, self.hparams.image_size, device=device)
             })
             
-        # If for some reason the whole batch is empty (should not happen if batch_size > 0),
-        # return a zero loss to be safe.
+        # Handle edge case of completely empty batch
         if not final_pseudo_targets:
             return torch.tensor(0.0, device=device, requires_grad=True)
         
-        # Now, `strong_images` and `final_pseudo_targets` will always have the same length.
         _, unsup_losses_dict = self.student(pixel_values=strong_images, targets=final_pseudo_targets)
-        # ============================= END: FINAL ROBUSTNESS FIX =============================
-        
         return sum(unsup_losses_dict.values())
-    
 
     def _get_sup_loss_mrcnn(self, pixel_values: torch.Tensor, targets: List[Dict]) -> torch.Tensor:
+        """Compute supervised loss for Mask R-CNN model.
+        
+        Args:
+            pixel_values: Input images tensor
+            targets: Target annotations for Mask R-CNN
+            
+        Returns:
+            Total supervised loss
+        """
         targets_mrcnn = self._prepare_mrcnn_targets(targets)
-        # The model returns a (predictions, losses) tuple.
-        # We only need the second element, which contains the loss dictionary.
         _, losses_sup_dict = self.student(pixel_values, targets_mrcnn)
         return sum(losses_sup_dict.values())
     

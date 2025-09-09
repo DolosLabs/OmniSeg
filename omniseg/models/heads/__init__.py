@@ -16,7 +16,7 @@ def get_head(head_type: str, num_classes: int, **kwargs) -> BaseHead:
         'deformable_detr': DETRSegmentationHead,
         'contourformer': ContourFormerHead,
         'lw_detr': LWDETRHead,
-        'sparrow_seg':SparrowSegHead
+        'sparrow_seg': SparrowSegHead
     }
     
     if head_type not in head_classes:
@@ -31,7 +31,7 @@ __all__ = [
     'MaskRCNNHead',
     'DETRSegmentationHead', 
     'ContourFormerHead',
-    'LWDETRSegmentationHead',
+    'LWDETRHead',
     'SparrowSegHead',
     'get_head'
 ]
