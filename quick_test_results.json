@@ -26,10 +26,10 @@
   "simple_lw_detr": {
     "backbone": "simple",
     "head": "lw_detr",
-    "status": "working",
-    "instantiation": true,
-    "forward_pass": true,
-    "error": null
+    "status": "failed",
+    "instantiation": false,
+    "forward_pass": false,
+    "error": "Head failed: Unsupported head_type: lw_detr. Available options: ['maskrcnn', 'deformable_detr', 'contourformer', 'sparrow_seg']"
   },
   "simple_sparrow_seg": {
     "backbone": "simple",

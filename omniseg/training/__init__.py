@@ -6,7 +6,7 @@ import pytorch_lightning as pl
 from torchvision import transforms
 from torchvision.ops import box_convert, masks_to_boxes
 from torchmetrics.detection import MeanAveragePrecision
-from typing import Dict, List, Tuple, Any, Union
+from typing import Dict, List, Tuple, Union
 
 class SSLSegmentationLightning(pl.LightningModule):
     def __init__(self,
