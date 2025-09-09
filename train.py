@@ -31,13 +31,9 @@ def main():
     parser.add_argument('--head_config', type=str, default='{}',
                         help="JSON string with kwargs to override the head's default parameters, e.g., '{\"d_model\": 96, \"num_queries\": 30}'.")
 
-    # --- MODIFIED: Added --epochs argument ---
-    # The default value is taken from the config file but can be overridden from the command line.
     parser.add_argument('--epochs', type=int, default=EPOCHS,
                         help="Number of training epochs to run.")
-    # ----------------------------------------
 
-    # All other arguments remain the same
     parser.add_argument('--learning_rate', type=float, default=5e-5, help="Learning rate for the optimizer.")
     parser.add_argument('--image_size', type=int, default=None,
                         help="Custom image size for resizing. Overrides backbone-specific defaults.")
@@ -189,9 +185,7 @@ def main():
     strategy = "ddp_find_unused_parameters_true" if args.find_unused_parameters else "ddp"
 
     trainer = pl.Trainer(
-        # --- MODIFIED: Use the command-line argument for max_epochs ---
         max_epochs=args.epochs,
-        # ------------------------------------------------------------
         max_steps=args.max_steps,
         accelerator="auto",
         devices="auto",

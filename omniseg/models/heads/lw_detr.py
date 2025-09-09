@@ -42,54 +42,31 @@ class BaseHead:
         print(f"Initialized BaseHead with {num_classes} classes and backbone '{backbone_type}'.")
 
 
-# --- Deformable attention (attempt import, fallback if needed) ---
+# --- Deformable attention import ---
+from ...utils.deformable_attention import get_deformable_attention
+
+# Get DeformableAttention with centralized warning handling
+DeformableAttention = get_deformable_attention()
 
 
-try:
-    from torchvision.ops.deformable_attention import DeformableAttention
-    print("INFO: Successfully imported torchvision DeformableAttention.")
-except ImportError as e:
-    print("=" * 60)
-    print("CRITICAL WARNING: Failed to import the official DeformableAttention.")
-    print(f"THE IMPORT ERROR WAS: {e}")
-    print("Falling back to the pure-PyTorch implementation, which is causing errors.")
-    print("Please check your torch/torchvision/CUDA installation.")
-    print("=" * 60)
-    class PurePyTorchDeformableAttention(nn.Module):
-        def __init__(self, d_model, n_levels, n_heads, n_points):
-            super().__init__()
-            self.n_heads = n_heads
-            self.n_levels = n_levels
-            self.n_points = n_points
-            self.d_model = d_model
-            self.head_dim = d_model // n_heads
-        
-            self.sampling_offsets = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
-            self.attention_weights = nn.Linear(d_model, n_heads * n_levels * n_points)
-            self.value_proj = nn.Linear(d_model, d_model)
-            self.output_proj = nn.Linear(d_model, d_model)
-            self._reset_parameters()
-        
-        def _reset_parameters(self):
-            nn.init.constant_(self.sampling_offsets.weight, 0.0)
-            nn.init.constant_(self.sampling_offsets.bias, 0.0)
-            nn.init.xavier_uniform_(self.attention_weights.weight)
-            nn.init.constant_(self.attention_weights.bias, 0.0)
-            nn.init.xavier_uniform_(self.value_proj.weight)
-            nn.init.constant_(self.value_proj.bias, 0.0)
-            nn.init.xavier_uniform_(self.output_proj.weight)
-            nn.init.constant_(self.output_proj.bias, 0.0)
-        
-        def forward(
-            self,
-            query,
-            reference_points,
-            input_flatten,
-            input_spatial_shapes,
-            input_level_start_index,
-            input_padding_mask=None,
-        ):
-            N, Lq, C = query.shape
+# --- Helpers ---
+
+
+def inverse_sigmoid(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    x = x.clamp(min=0.0, max=1.0)
+    x1 = x.clamp(min=eps)
+    x2 = (1.0 - x).clamp(min=eps)
+    return torch.log(x1 / x2)
+
+
+def _get_clones(module: nn.Module, N: int) -> nn.ModuleList:
+    return nn.ModuleList([deepcopy(module) for _ in range(N)])
+
+
+# --- Backbone wrapper ---
+
+# 🚀 NEW: Path Aggregation Network (PANet) Module
+class PANetFPN(nn.Module):
             N2, L, C2 = input_flatten.shape
             assert N == N2 and C == C2, "Shape mismatch between query and input_flatten"
             value = self.value_proj(input_flatten).view(N, L, self.n_heads, self.head_dim)
@@ -127,8 +104,6 @@ except ImportError as e:
             output = (sampled_values * attn).sum(-1).sum(-1)  # Sum over n_points then n_levels
             output = output.permute(0, 3, 1, 2).reshape(N, Lq, C)
             return self.output_proj(output)
-
-    DeformableAttention = PurePyTorchDeformableAttention  # type: ignore
 
 
 # --- Helpers ---

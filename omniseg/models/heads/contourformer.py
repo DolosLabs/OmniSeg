@@ -26,7 +26,6 @@ class BaseHead:
 def get_backbone(backbone_type):
     # This is a placeholder for your actual backbone loader
     import torchvision.models as models
-    from torch.nn.modules.container import Sequential
     from torchvision.models._utils import IntermediateLayerGetter
     
     # Using ResNet50 as an example backbone

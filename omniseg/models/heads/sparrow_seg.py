@@ -39,26 +39,12 @@ from torchvision.ops import FeaturePyramidNetwork, box_convert, generalized_box_
 from ..base import BaseHead
 from ..backbones import get_backbone
 
-# --- Deformable attention (from your template) ---
-try:
-    from torchvision.ops.deformable_attention import DeformableAttention
-    print("INFO: Successfully imported torchvision DeformableAttention.")
-except ImportError:
-    print("=" * 60)
-    print("CRITICAL WARNING: Failed to import the official DeformableAttention.")
-    print("Falling back to a placeholder. This will be slow and may have issues.")
-    print("Please check your torch/torchvision/CUDA installation.")
-    print("=" * 60)
-    class PurePyTorchDeformableAttention(nn.Module):
-        def __init__(self, d_model, n_levels, n_heads, n_points):
-            super().__init__()
-            self.d_model = d_model
-            # This is a non-functional placeholder for syntax compatibility
-        def forward(self, query, reference_points, input_flatten, input_spatial_shapes, input_level_start_index, input_padding_mask=None):
-            return query
-    DeformableAttention = PurePyTorchDeformableAttention
+# --- Deformable attention import ---
+from ...utils.deformable_attention import get_deformable_attention
 
-# --- Helpers (from your template) ---
+# Get DeformableAttention with centralized warning handling
+DeformableAttention = get_deformable_attention()
+# --- Helpers ---
 def _get_clones(module: nn.Module, N: int) -> nn.ModuleList:
     return nn.ModuleList([deepcopy(module) for _ in range(N)])
 

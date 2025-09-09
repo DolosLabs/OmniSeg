@@ -1,18 +1,14 @@
 """
-Optimized implementation of a DETR-style segmentation head.
+Deformable DETR implementation for instance segmentation.
 
-NOTE: The original 'DeformableDETRHead' was a misnomer. This implementation uses a
-standard Transformer decoder, not the multi-scale deformable attention from the
-Deformable DETR paper. The class has been renamed to `DETRSegmentationHead` for clarity.
+This implementation includes optimizations for better convergence including:
+- Simplified and stable box prediction mechanism
+- Proper bias initialization for classification head  
+- Reduced auxiliary loss complexity
+- Enhanced feature extraction with PANetFPN option
+
+Based on the Deformable DETR paper with convergence improvements from lw_detr.
 """
-# PATCHED: This file has been updated to use a proper Deformable Transformer Decoder,
-# auxiliary losses, stable box prediction, and iterative refinement for better convergence.
-# 
-# CONVERGENCE IMPROVEMENTS: Applied optimizations from lw_detr including:
-# - Simplified and more stable box prediction mechanism
-# - Proper bias initialization for classification head  
-# - Reduced auxiliary loss complexity
-# - Enhanced feature extraction with PANetFPN option
 
 from collections import OrderedDict
 from typing import Dict, List, Optional
@@ -25,102 +21,21 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from torchvision.ops import FeaturePyramidNetwork, box_convert, generalized_box_iou
 
-from ..backbones import get_backbone  # project-specific
-# Assuming these are defined in your project structure
-# Creating dummy classes for self-contained execution
+from ..backbones import get_backbone
 class BaseHead:
     def __init__(self, num_classes: int, backbone_type: str, image_size: int, *args, **kwargs):
         self.num_classes = num_classes
         self.backbone_type = backbone_type
         self.image_size = image_size
 
-# --- Deformable attention (from lw_detr.py) ---
-try:
-    from torchvision.ops.deformable_attention import DeformableAttention
-    print("INFO: Successfully imported torchvision DeformableAttention.")
-except ImportError as e:
-    print("=" * 60)
-    print("CRITICAL WARNING: Failed to import the official DeformableAttention.")
-    print(f"THE IMPORT ERROR WAS: {e}")
-    print("Falling back to a pure-PyTorch implementation, which may be slow or buggy.")
-    print("Please check your torch/torchvision/CUDA installation.")
-    print("=" * 60)
-    class PurePyTorchDeformableAttention(nn.Module):
-        def __init__(self, d_model, n_levels, n_heads, n_points):
-            super().__init__()
-            self.n_heads = n_heads
-            self.n_levels = n_levels
-            self.n_points = n_points
-            self.d_model = d_model
-            self.head_dim = d_model // n_heads
+# --- Deformable attention import ---
+from ...utils.deformable_attention import get_deformable_attention
 
-            self.sampling_offsets = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
-            self.attention_weights = nn.Linear(d_model, n_heads * n_levels * n_points)
-            self.value_proj = nn.Linear(d_model, d_model)
-            self.output_proj = nn.Linear(d_model, d_model)
-            self._reset_parameters()
-
-        def _reset_parameters(self):
-            nn.init.constant_(self.sampling_offsets.weight, 0.0)
-            nn.init.constant_(self.sampling_offsets.bias, 0.0)
-            nn.init.xavier_uniform_(self.attention_weights.weight)
-            nn.init.constant_(self.attention_weights.bias, 0.0)
-            nn.init.xavier_uniform_(self.value_proj.weight)
-            nn.init.constant_(self.value_proj.bias, 0.0)
-            nn.init.xavier_uniform_(self.output_proj.weight)
-            nn.init.constant_(self.output_proj.bias, 0.0)
-
-        def forward(
-            self,
-            query,
-            reference_points,
-            input_flatten,
-            input_spatial_shapes,
-            input_level_start_index,
-            input_padding_mask=None,
-        ):
-            N, Lq, C = query.shape
-            N2, L, C2 = input_flatten.shape
-            assert N == N2 and C == C2, "Shape mismatch between query and input_flatten"
-            value = self.value_proj(input_flatten).view(N, L, self.n_heads, self.head_dim)
-            offsets = self.sampling_offsets(query).view(N, Lq, self.n_heads, self.n_levels, self.n_points, 2)
-            attention_weights = self.attention_weights(query).view(N, Lq, self.n_heads, self.n_levels, self.n_points)
-            attention_weights = F.softmax(attention_weights, -1)
-
-            if reference_points.shape[-1] == 2:
-                ref = reference_points.unsqueeze(2).unsqueeze(4)
-                offset_normalizer = torch.stack([input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
-                offset_normalizer = offset_normalizer[None, None, None, :, None, :]
-                sampling_locations = ref + offsets / offset_normalizer
-            else:
-                ref_xy = reference_points[..., :2].unsqueeze(2).unsqueeze(3).unsqueeze(4)
-                ref_wh = reference_points[..., 2:].unsqueeze(2).unsqueeze(3).unsqueeze(4)
-                sampling_locations = ref_xy + offsets / self.n_points * ref_wh * 0.5
-
-            splits = [H * W for H, W in input_spatial_shapes]
-            value_list = value.split(splits, dim=1)
-            sampling_grids = 2 * sampling_locations - 1
-            sampled_value_list = []
-
-            for lvl, (H, W) in enumerate(input_spatial_shapes):
-                v_l = value_list[lvl].transpose(1, 2).reshape(N * self.n_heads, self.head_dim, H, W)
-                grid_l = sampling_grids[:, :, :, lvl].permute(0, 2, 1, 3, 4).reshape(N * self.n_heads, Lq * self.n_points, 2)
-                grid_l = grid_l.unsqueeze(1)
-                sampled = F.grid_sample(v_l, grid_l, mode="bilinear", padding_mode="zeros", align_corners=False)
-                sampled = sampled.squeeze(2).reshape(N, self.n_heads, self.head_dim, Lq, self.n_points)
-                sampled_value_list.append(sampled)
-
-            sampled_values = torch.stack(sampled_value_list, dim=4)
-            attn = attention_weights.permute(0, 2, 1, 3, 4)
-            attn = attn.unsqueeze(2)
-            output = (sampled_values * attn).sum(-1).sum(-1)
-            output = output.permute(0, 3, 1, 2).reshape(N, Lq, C)
-            return self.output_proj(output)
-
-    DeformableAttention = PurePyTorchDeformableAttention
+# Get DeformableAttention with centralized warning handling
+DeformableAttention = get_deformable_attention()
 
 
-# --- Deformable Decoder Layer (from lw_detr.py) ---
+# --- Deformable Decoder Layer ---
 class DeformableTransformerDecoderLayer(nn.Module):
     def __init__(self, d_model: int = 256, n_heads: int = 8, d_ffn: int = 1024, dropout: float = 0.1, n_levels: int = 4, n_points: int = 4):
         super().__init__()
