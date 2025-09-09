@@ -137,36 +137,41 @@ def generate_shapes_image():
 # -------------------------
 # Generate dataset
 # -------------------------
-splits = {"train": N_TRAIN, "val": N_VAL, "test": N_TEST}
+def main():
+    splits = {"train": N_TRAIN, "val": N_VAL, "test": N_TEST}
 
-for split_name,num_images in splits.items():
-    coco = {"info":{"description":"LW-DETR tiny synthetic dataset for DINOv3"},
-            "licenses":[],"images":[],"annotations":[],"categories":CATEGORIES}
-    ann_id = 1
+    for split_name,num_images in splits.items():
+        coco = {"info":{"description":"LW-DETR tiny synthetic dataset for DINOv3"},
+                "licenses":[],"images":[],"annotations":[],"categories":CATEGORIES}
+        ann_id = 1
 
-    for img_idx in range(num_images):
-        image_id = img_idx+1
-        filename = f"{image_id:012d}.jpg"
-        image_path = os.path.join(IMAGES_DIR[split_name], filename)
+        for img_idx in range(num_images):
+            image_id = img_idx+1
+            filename = f"{image_id:012d}.jpg"
+            image_path = os.path.join(IMAGES_DIR[split_name], filename)
 
-        canvas, shapes_info = generate_shapes_image()
-        canvas.save(image_path,'JPEG')
+            canvas, shapes_info = generate_shapes_image()
+            canvas.save(image_path,'JPEG')
 
-        coco["images"].append({"id":image_id,"width":CANVAS_SIZE[0],"height":CANVAS_SIZE[1],"file_name":filename})
+            coco["images"].append({"id":image_id,"width":CANVAS_SIZE[0],"height":CANVAS_SIZE[1],"file_name":filename})
 
-        for s in shapes_info:
-            coco["annotations"].append({
-                "id": ann_id,
-                "image_id": image_id,
-                "category_id": s['category_id'],
-                "segmentation": s['segmentation'],
-                "area": s['area'],
-                "bbox": s['bbox'],
-                "iscrowd": 0
-            })
-            ann_id += 1
+            for s in shapes_info:
+                coco["annotations"].append({
+                    "id": ann_id,
+                    "image_id": image_id,
+                    "category_id": s['category_id'],
+                    "segmentation": s['segmentation'],
+                    "area": s['area'],
+                    "bbox": s['bbox'],
+                    "iscrowd": 0
+                })
+                ann_id += 1
 
-    with open(os.path.join(ANNOTATIONS_DIR,f"instances_{split_name}2017.json"),'w') as f:
-        json.dump(coco,f)
+        with open(os.path.join(ANNOTATIONS_DIR,f"instances_{split_name}2017.json"),'w') as f:
+            json.dump(coco,f)
 
-print("DINOv3-optimized LW-DETR tiny COCO dataset generated successfully!")
+    print("DINOv3-optimized LW-DETR tiny COCO dataset generated successfully!")
+
+
+if __name__ == "__main__":
+    main()
