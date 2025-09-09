@@ -92,7 +92,7 @@ for backbone, head in experiments:
     # print(f"\n📊 Running visualization for {backbone}_{head} using {best_ckpt}\n")
 
     # --- Run visualization ---
-    viz_cmd = ["python", "visualize_model.py", best_ckpt,"--backbone",backbone,"--num_images",str(100)]
+    viz_cmd = ["python", "visualize_model.py", best_ckpt,"--backbone",backbone,"--num_images",str(100),"--validate"]
     subprocess.run(viz_cmd, check=True)
 gen_stats_cmd = [
     "python",

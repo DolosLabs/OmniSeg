@@ -89,18 +89,26 @@ python train.py --backbone dino --head maskrcnn --image_size 64
 
 ## 📊 Results and Visualizations
 
-Here are some sample predictions and performance metrics from different model combinations. The **validation mAP** (mean Average Precision) is a key metric for instance segmentation quality.
-
-| Backbone | Head | Epochs | Validation mAP | Example Output |
-| :--- | :--- | :--- | :--- | :--- |
-| **ResNet** | Mask R-CNN | 13 | **0.55** | ![ResNet + Mask R-CNN](docs/resnet_maskrcnn_predictions_best-model-epoch=13-val_mAP=0.5475_228.5ms.png) |
-| **DINO** | Deformable DETR | 129 | 0.44 | ![DINO + Deformable DETR](docs/dino_deformable_detr_predictions_best-model-epoch=129-val_mAP=0.4353_141.9ms.png) |
-| **DINO** | LW-DETR | 119 | 0.37 | ![DINO + LW-DETR](docs/dino_lw_detr_predictions_best-model-epoch=119-val_mAP=0.3673_192.1ms.png) |
-| **DINO** | Sparrow-Seg | 79 | 0.15 | ![DINO + Sparrow-Seg](docs/dino_sparrow_seg_predictions_best-model-epoch=79-val_mAP=0.1532_153.6ms.png) |
+Here are some sample predictions and performance metrics from different model combinations. The **test mAP** (mean Average Precision) is a key metric for instance segmentation quality.
+ ![Results cont.](docs/images/final_mAP_barchart.png)
+| Backbone | Head | Epochs | Test mAP | Inference (ms) | Example Output |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **ResNet** | LW-DETR | 11 | **0.599** | 75.8 | ![ResNet + LW-DETR](docs/images/resnet_lw_detr_best-model-epoch=11-val_mAP=0.6159_75.8ms_map_0.599.png) |
+| **DINO** | Mask R-CNN | 16 | **0.569** | 183.2 | ![DINO + Mask R-CNN](docs/images/dino_maskrcnn_best-model-epoch=16-val_mAP=0.5715_183.2ms_map_0.569.png) |
+| **ResNet** | Deformable DETR | 13 | **0.566** | 12.2 | ![ResNet + Deformable DETR](docs/images/resnet_deformable_detr_best-model-epoch=13-val_mAP=0.5834_12.2ms_map_0.566.png) |
+| DINO | Deformable DETR | 129 | 0.561 | 24.4 | ![DINO + Deformable DETR](docs/images/dino_deformable_detr_best-model-epoch=19-val_mAP=0.5647_24.4ms_map_0.561.png) |
+| RepVGG | Mask R-CNN | 13 | 0.551 | 34.9 | ![RepVGG + Mask R-CNN](docs/images/repvgg_maskrcnn_best-model-epoch=13-val_mAP=0.5519_34.9ms_map_0.551.png) |
+| ResNet | Mask R-CNN | 13 | 0.513 | 37.0 | ![ResNet + Mask R-CNN](docs/images/resnet_maskrcnn_best-model-epoch=12-val_mAP=0.5348_37.0ms_map_0.513.png) |
+| ConvNext | Mask R-CNN | 13 | 0.510 | 51.4 | ![ConvNext + Mask R-CNN](docs/images/convnext_maskrcnn_best-model-epoch=07-val_mAP=0.5120_51.4ms_map_0.510.png) |
+| RepVGG | LW-DETR | 11 | 0.379 | 77.8 | ![RepVGG + LW-DETR](docs/images/repvgg_lw_detr_best-model-epoch=08-val_mAP=0.4055_77.8ms_map_0.379.png) |
+| ConvNext | LW-DETR | 11 | 0.359 | 80.0 | ![ConvNext + LW-DETR](docs/images/convnext_lw_detr_best-model-epoch=14-val_mAP=0.4441_80.0ms_map_0.359.png) |
+| RepVGG | Deformable DETR | 13 | 0.299 | 15.4 | ![RepVGG + Deformable DETR](docs/images/repvgg_deformable_detr_best-model-epoch=11-val_mAP=0.3355_15.4ms_map_0.299.png) |
+| ConvNext | Deformable DETR | 13 | 0.254 | 16.7 | ![ConvNext + Deformable DETR](docs/images/convnext_deformable_detr_best-model-epoch=35-val_mAP=0.3022_16.7ms_map_0.254.png) |
+| DINO | Sparrow-Seg | 79 | 0.252 | 19.6 | ![DINO + Sparrow-Seg](docs/images/dino_sparrow_seg_best-model-epoch=29-val_mAP=0.2745_19.6ms_map_0.252.png) |
+| DINO | LW-DETR | 119 | 0.282 | 88.2 | ![DINO + LW-DETR](docs/images/dino_lw_detr_best-model-epoch=129-val_mAP=0.2886_88.2ms_map_0.282.png) |
 
 Overall Results
- ![Results](docs/map_vs_inference_time.png)
-
+ ![Results](docs/images/dual_performance_heatmaps.png)
 To generate your own visualizations from a checkpoint:
 
 ```bash

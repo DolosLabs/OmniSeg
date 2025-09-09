@@ -146,6 +146,21 @@ class HungarianMatcher(nn.Module):
         self.cost_mask = cost_mask
         self.cost_dice = cost_dice
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.ops import box_convert, generalized_box_iou
+from scipy.optimize import linear_sum_assignment
+
+class HungarianMatcher(nn.Module):
+    def __init__(self, cost_class: float = 2.0, cost_bbox: float = 5.0, cost_giou: float = 2.0, cost_mask: float = 5.0, cost_dice: float = 5.0):
+        super().__init__()
+        self.cost_class = cost_class
+        self.cost_bbox = cost_bbox
+        self.cost_giou = cost_giou
+        self.cost_mask = cost_mask
+        self.cost_dice = cost_dice
+
     @torch.no_grad()
     def forward(self, outputs, targets):
         bs, num_queries_per_image = outputs["pred_logits"].shape[:2]
@@ -154,23 +169,46 @@ class HungarianMatcher(nn.Module):
         out_bbox = outputs["pred_boxes"].flatten(0, 1)
         out_mask = outputs["pred_masks"].flatten(0, 1)
 
+        # --- FIX: Resize target masks to a consistent size before concatenation ---
         tgt_ids = torch.cat([v["labels"] for v in targets])
         tgt_bbox = torch.cat([v["boxes"] for v in targets])
-        tgt_mask = torch.cat([v["masks"] for v in targets])
+        
+        # 1. Determine the target spatial size from the model's output masks.
+        target_size = out_mask.shape[-2:]
+        
+        # 2. Iterate, resize each mask tensor, and then concatenate.
+        resized_tgt_masks = []
+        for v in targets:
+            masks = v["masks"]
+            # Add a channel dimension if it's missing (N, H, W) -> (N, 1, H, W)
+            if masks.dim() == 3:
+                masks = masks.unsqueeze(1)
+            
+            resized_mask = F.interpolate(
+                masks.float(), size=target_size, mode="bilinear", align_corners=False
+            )
+            # Remove the channel dimension after resizing
+            resized_tgt_masks.append(resized_mask.squeeze(1))
+            
+        tgt_mask = torch.cat(resized_tgt_masks, dim=0)
+        # --- End of Fix ---
 
         cost_class = -out_prob[:, tgt_ids]
         cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
         cost_giou = -generalized_box_iou(box_convert(out_bbox, "cxcywh", "xyxy"), box_convert(tgt_bbox, "cxcywh", "xyxy"))
 
-        tgt_mask_res = F.interpolate(tgt_mask.unsqueeze(1), size=out_mask.shape[-2:], mode="bilinear", align_corners=False).squeeze(1)
-        out_mask_flat, tgt_mask_flat = out_mask.sigmoid().flatten(1), tgt_mask_res.flatten(1)
+        # The rest of the logic can now proceed with consistently sized masks.
+        # Note: The original interpolation on tgt_mask is now redundant but harmless.
+        # It's better to use the already-resized tgt_mask directly.
+        out_mask_flat, tgt_mask_flat = out_mask.sigmoid().flatten(1), tgt_mask.flatten(1)
 
-        # --- FIX 1: Correctly calculate pairwise BCE mask cost ---
+        # Calculate pairwise BCE mask cost
         num_preds = out_mask_flat.shape[0]
         num_targets = tgt_mask_flat.shape[0]
         out_mask_expanded = out_mask_flat.unsqueeze(1).expand(num_preds, num_targets, -1)
         tgt_mask_expanded = tgt_mask_flat.unsqueeze(0).expand(num_preds, num_targets, -1)
-        cost_mask = F.binary_cross_entropy_with_logits(out_mask_expanded, tgt_mask_expanded, reduction="none").mean(-1)
+        # Use out_mask directly for logits version of BCE
+        cost_mask = F.binary_cross_entropy(out_mask_expanded, tgt_mask_expanded, reduction="none").mean(-1)
         
         # Calculate Dice cost
         numerator = 2 * (out_mask_flat @ tgt_mask_flat.T)
@@ -179,7 +217,7 @@ class HungarianMatcher(nn.Module):
         
         C = (self.cost_bbox * cost_bbox + self.cost_giou * cost_giou + self.cost_class * cost_class + self.cost_mask * cost_mask + self.cost_dice * cost_dice)
 
-        # --- FIX 2: Correctly reshape cost matrix for distributed training ---
+        # Correctly reshape cost matrix for distributed training
         C = C.view(bs, num_queries_per_image, -1).cpu()
 
         sizes = [len(v["boxes"]) for v in targets]

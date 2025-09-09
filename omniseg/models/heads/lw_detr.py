@@ -309,23 +309,43 @@ class HungarianMatcher(nn.Module):
         C = self.cost_bbox * cost_bbox + self.cost_giou * cost_giou + self.cost_class * cost_class
 
         if "pred_masks" in outputs and "masks" in targets[0]:
-            out_masks = outputs["pred_masks"].flatten(0, 1)
-            tgt_masks = torch.cat([v["masks"] for v in targets], dim=0)
-            # Convert boolean masks to float for interpolation
-            tgt_masks = tgt_masks.float()
-            tgt_masks = F.interpolate(tgt_masks.unsqueeze(1), size=out_masks.shape[-2:], mode="bilinear", align_corners=False).squeeze(1)
-            out_flat, tgt_flat = out_masks.sigmoid().flatten(1), tgt_masks.flatten(1)
+            # Flatten predicted masks
+            out_masks = outputs["pred_masks"].flatten(0, 1)  # (B*Q, H_out, W_out)
+            out_shape = out_masks.shape[-2:]  # height, width
 
+            # Resize each target mask individually before concatenation
+            resized_masks = []
+            for v in targets:
+                mask = v["masks"].float()  # convert to float if boolean
+                mask = F.interpolate(
+                    mask.unsqueeze(1),       # add channel dim
+                    size=out_shape,
+                    mode="nearest"           # nearest preserves binary mask values
+                ).squeeze(1)                 # remove channel dim
+                resized_masks.append(mask)
+
+            # Safe concatenation
+            tgt_masks = torch.cat(resized_masks, dim=0)
+
+            # Flatten for loss computation
+            out_flat = out_masks.sigmoid().flatten(1)  # (B*Q, H*W)
+            tgt_flat = tgt_masks.flatten(1)
+
+            # Dice loss
             numerator = 2 * (out_flat @ tgt_flat.T)
             denominator = out_flat.sum(-1)[:, None] + tgt_flat.sum(-1)[None, :]
             cost_dice = -(numerator + 1) / (denominator.clamp(min=1e-6) + 1)
 
+            # BCE loss
             n_pred, n_tgt = out_flat.shape[0], tgt_flat.shape[0]
             out_expanded = out_flat.unsqueeze(1).expand(n_pred, n_tgt, -1)
             tgt_expanded = tgt_flat.unsqueeze(0).expand(n_pred, n_tgt, -1)
             cost_mask = F.binary_cross_entropy(out_expanded, tgt_expanded, reduction="none").mean(-1)
 
+            # Combine
             C = C + (self.cost_mask * cost_mask + self.cost_dice * cost_dice)
+
+
 
         C = C.view(bs, num_queries, -1).cpu()
         sizes = [len(v["boxes"]) for v in targets]
@@ -412,40 +432,53 @@ class SetCriterion(nn.Module):
         }
 
     def loss_masks(self, outputs, targets, indices, num_objects):
-        """Mask losses (same as deformable_detr)."""
+        """
+        Mask losses (same as deformable_detr).
+        This version is updated to handle target masks of varying sizes within a batch.
+        """
         if "pred_masks" not in outputs or "masks" not in targets[0]:
             return {"loss_mask": torch.tensor(0.0, device=next(iter(outputs.values())).device),
                     "loss_dice": torch.tensor(0.0, device=next(iter(outputs.values())).device)}
             
         src_idx = self._get_permutation_idx(indices)
-        src_masks = outputs["pred_masks"][src_idx]
+        src_masks = outputs["pred_masks"][src_idx] # Shape: [num_matched_objects, H_pred, W_pred]
+
+        # --- Start of Changed Block ---
+
+        # Instead of concatenating differently-sized masks, we resize them individually first.
+        target_masks_resized = []
+        for t, (_, i) in zip(targets, indices):
+            # Select the ground truth masks for the current image based on matching indices
+            matched_masks = t['masks'][i].to(src_masks.dtype)
+
+            # Resize the masks for THIS image to match the prediction size
+            # Add a channel dimension for interpolate, then remove it
+            resized = F.interpolate(
+                matched_masks.unsqueeze(1),
+                size=src_masks.shape[-2:],
+                mode="bilinear",
+                align_corners=False
+            ).squeeze(1)
+            target_masks_resized.append(resized)
         
-        target_masks = torch.cat([t['masks'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        # Concatenate the now uniformly-sized masks
+        target_masks = torch.cat(target_masks_resized, dim=0)
+
+        # --- End of Changed Block ---
         
-        # Convert boolean masks to float for interpolation and loss computation
-        target_masks = target_masks.float()
-        
-        # Resize target masks to match predicted mask size
-        target_masks_resized = F.interpolate(
-            target_masks.unsqueeze(1), 
-            size=src_masks.shape[-2:], 
-            mode="bilinear", 
-            align_corners=False
-        ).squeeze(1)
-        
-        # Use float() for BCE and Dice compatibility
-        target_masks_resized = target_masks_resized.to(src_masks.dtype)
+        # The target masks are now guaranteed to be the same size as src_masks
+        # and have the correct data type.
         
         # BCE loss
-        loss_mask = F.binary_cross_entropy_with_logits(src_masks, target_masks_resized, reduction='none')
-        loss_mask = loss_mask.mean(dim=(1, 2))  # Average over pixels
+        loss_mask = F.binary_cross_entropy_with_logits(src_masks, target_masks, reduction='none')
+        loss_mask = loss_mask.mean(dim=(1, 2))  # Average over pixels for each mask
 
         # Dice loss
-        loss_dice = dice_loss(src_masks, target_masks_resized)
+        loss_dice = dice_loss(src_masks, target_masks)
         
         return {
             "loss_mask": loss_mask.sum() / num_objects,
-            "loss_dice": loss_dice
+            "loss_dice": loss_dice.sum() / num_objects # Normalize dice loss as well for consistency
         }
 
     def forward(self, outputs, targets):
