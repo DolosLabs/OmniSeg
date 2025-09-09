@@ -61,7 +61,7 @@ def main():
                         help="Number of steps to ramp up unsupervised loss weight after warmup.")
     parser.add_argument('--val_every_n_epoch', type=int, default=1, help="Run validation every N epochs.")
     parser.add_argument('--use_tiny_data', action='store_true',
-                        help="Use the tiny synthetic dataset for quick training/testing (run python -m omniseg.utils.generate_tiny_data first).")
+                        help="Use the tiny synthetic dataset for quick training/testing (run generate_tiny_data.py first).")
     parser.add_argument('--early_stopping_patience', type=int, default=25,
                         help="Patience for early stopping. Training stops after this many epochs of no improvement.")
     parser.add_argument('--early_stopping_monitor', type=str, default='val_mAP',
