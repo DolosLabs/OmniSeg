@@ -44,7 +44,7 @@ pip install -r requirements.txt
 Prepare the tiny dataset (recommended for testing):
 
 ```bash
-python generate_tiny_data.py
+python -m omniseg.utils.generate_tiny_data
 ```
 
 Or prepare the COCO 2017 dataset:
@@ -112,12 +112,12 @@ python visualize_model.py path/to/your/checkpoint.ckpt --backbone resnet
 ## 🔧 Project Structure
 
 ```
-omniseg/      # Main package
+omniseg/      # Main package (includes utilities in omniseg/utils/)
 tests/        # Test modules
 docs/         # Documentation
-generate_tiny_data.py
 train.py
 visualize_model.py
+experiment.py
 ```
 
 -----

@@ -32,20 +32,6 @@ for d in IMAGES_DIR.values():
     os.makedirs(d, exist_ok=True)
 
 # -------------------------
-# Download MNIST
-# -------------------------
-mnist_train = torchvision.datasets.MNIST(root="./data", train=True, download=True)
-mnist_test = torchvision.datasets.MNIST(root="./data", train=False, download=True)
-all_data = list(mnist_train) + list(mnist_test)
-random.shuffle(all_data)
-
-splits = {
-    "train": all_data[:N_TRAIN],
-    "val": all_data[N_TRAIN:N_TRAIN+N_VAL],
-    "test": all_data[N_TRAIN+N_VAL:N_TRAIN+N_VAL+N_TEST]
-}
-
-# -------------------------
 # Helper functions
 # -------------------------
 def get_bbox(mask, x_offset, y_offset):
@@ -64,10 +50,26 @@ def get_rle(mask):
     rle['counts'] = rle['counts'].decode('utf-8')
     return rle
 
-# -------------------------
-# Generate COCO JSON + images
-# -------------------------
-category_ids = {str(i): i+1 for i in range(10)}
+
+def main():
+    # -------------------------
+    # Download MNIST
+    # -------------------------
+    mnist_train = torchvision.datasets.MNIST(root="./data", train=True, download=True)
+    mnist_test = torchvision.datasets.MNIST(root="./data", train=False, download=True)
+    all_data = list(mnist_train) + list(mnist_test)
+    random.shuffle(all_data)
+
+    splits = {
+        "train": all_data[:N_TRAIN],
+        "val": all_data[N_TRAIN:N_TRAIN+N_VAL],
+        "test": all_data[N_TRAIN+N_VAL:N_TRAIN+N_VAL+N_TEST]
+    }
+
+    # -------------------------
+    # Generate COCO JSON + images
+    # -------------------------
+    category_ids = {str(i): i+1 for i in range(10)}
 
 for split_name, data in splits.items():
     coco = {
@@ -136,7 +138,12 @@ for split_name, data in splits.items():
         json.dump(coco, f)
     print(f"{split_name.upper()}: {len(coco['images'])} images, {len(coco['annotations'])} annotations saved")
 
-print("MNIST -> Multi-digit COCO conversion complete!")
+    print("MNIST -> Multi-digit COCO conversion complete!")
+
+
+if __name__ == "__main__":
+    main()
+
 
 # -------------------------
 # PyTorch Dataset
