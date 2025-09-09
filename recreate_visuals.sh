@@ -44,7 +44,7 @@ find "$BASE_RUNS_DIR" -type f -name "best-model-*.ckpt" | while read -r CKPT_PAT
     echo "   - Detected Backbone: $BACKBONE"
     
     # Construct and run the visualization command
-    python visualize_model.py "$CKPT_PATH" --backbone "$BACKBONE"
+    python visualize_model.py "$CKPT_PATH" --backbone "$BACKBONE" --validate
     
     echo "✅  Finished processing: $RUN_NAME"
     echo "---------------------------------------------------------"
