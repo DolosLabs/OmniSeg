@@ -88,10 +88,12 @@ class SSLSegmentationLightning(pl.LightningModule):
         # 1. Generate pseudo-labels from the teacher on the original ("weak") unlabeled images
         with torch.no_grad():
             self.teacher.eval()
-            teacher_preds, _ = self.teacher(pixel_values=pixel_values_u)
-        
+            # Handle different output formats for teacher predictions
+            teacher_output = self.teacher(pixel_values=pixel_values_u)
+            teacher_preds = teacher_output[0] if self.hparams.head_type == 'maskrcnn' else teacher_output
+
         pseudo_targets = self._create_pseudo_targets(teacher_preds, self.hparams.pseudo_label_thresh)
-        num_pseudo_boxes = sum(len(t['labels']) for t in pseudo_targets)
+        num_pseudo_boxes = sum(len(t.get('labels', [])) for t in pseudo_targets)
 
         if num_pseudo_boxes > 0:
             # 2. Create a strongly augmented view of the images on the fly
@@ -110,8 +112,8 @@ class SSLSegmentationLightning(pl.LightningModule):
 
         self.log_dict({
             "train_loss": total_loss,
-            "sup_loss": sup_loss,
-            "unsup_loss": unsup_loss,
+            "sup_loss": sup_loss.detach(),
+            "unsup_loss": unsup_loss.detach(),
             "unsup_weight": consistency_weight,
             "lr": self.trainer.optimizers[0].param_groups[0]['lr']
         }, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=batch_size)
@@ -124,36 +126,50 @@ class SSLSegmentationLightning(pl.LightningModule):
         if self.hparams.head_type != 'maskrcnn' and not isinstance(pixel_values, torch.Tensor):
             pixel_values = torch.stack(pixel_values, dim=0)
 
-        self.student.eval()
-
+        # --- Calculate validation loss ---
+        self.student.train() # Set to train mode for loss calculation
         with torch.no_grad():
             if self.hparams.head_type == 'maskrcnn':
-                self.student.train()
-                # The model now returns a tuple: (predictions, losses).
-                # In training mode, our workaround returns (loss_dict, loss_dict).
-                # We only need the second element here for the loss values.
-                _, val_loss_dict = self.student(pixel_values, self._prepare_mrcnn_targets(targets))
-                val_loss = sum(val_loss_dict.values())
-                
-                self.student.eval()
-                # In eval mode, the model returns (predictions, {}).
-                # We only need the first element here for the output predictions.
-                outputs, _ = self.student(pixel_values)
+                # Filter images and targets that become empty after preparation
+                prepared_targets = self._prepare_mrcnn_targets(targets)
+                valid_pixel_values = [img for img, t in zip(pixel_values, prepared_targets) if t['labels'].numel() > 0]
+                valid_targets = [t for t in prepared_targets if t['labels'].numel() > 0]
+                if valid_targets:
+                    _, val_loss_dict = self.student(valid_pixel_values, valid_targets)
+                    val_loss = sum(val_loss_dict.values())
+                else:
+                    val_loss = torch.tensor(0.0, device=self.device)
             else:
                 targets_detr = self._prepare_detr_targets(targets)
-                outputs, val_losses_dict = self.student(pixel_values=pixel_values, targets=targets_detr)
-                val_loss = sum(val_losses_dict.values()) if val_losses_dict else torch.tensor(0.0, device=self.device)
-
+                if targets_detr:
+                    _, val_losses_dict = self.student(pixel_values=pixel_values, targets=targets_detr)
+                    val_loss = sum(val_losses_dict.values())
+                else:
+                    val_loss = torch.tensor(0.0, device=self.device)
         self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+
+        # --- Calculate mAP ---
+        self.student.eval() # Set to eval mode for predictions
+        with torch.no_grad():
+            outputs, _ = self.student(pixel_values)
+
         targets_formatted = self._format_targets_for_metric(targets)
-        original_sizes = torch.tensor([t['masks'].shape[-2:] for t in targets], device=self.device)
+        original_sizes = torch.tensor([t.get('original_size', t['masks'].shape[-2:]) for t in targets], device=self.device)
 
         if self.hparams.head_type == 'maskrcnn':
             preds = self._format_preds_mrcnn(outputs)
         else:
             preds = self._format_preds_detr_style(outputs, original_sizes)
-
-        self.val_map.update(preds, targets_formatted)
+        
+        # Filter out empty predictions/targets before updating metric
+        valid_preds, valid_targets = [], []
+        for p, t in zip(preds, targets_formatted):
+            if p['scores'].numel() > 0 and t['labels'].numel() > 0:
+                valid_preds.append(p)
+                valid_targets.append(t)
+        
+        if valid_preds and valid_targets:
+            self.val_map.update(valid_preds, valid_targets)
 
     def on_validation_epoch_end(self):
         map_dict = self.val_map.compute()
@@ -165,63 +181,35 @@ class SSLSegmentationLightning(pl.LightningModule):
         self.val_map.reset()
 
     def _get_sup_loss_detr(self, pixel_values: torch.Tensor, targets: List[Dict]) -> torch.Tensor:
-        # ============================ THIS IS THE FIX ============================
-        # The raw targets are passed to this function. We must first process them
-        # to compute and add the 'boxes' key before sending them to the model.
         targets_detr = self._prepare_detr_targets(targets)
-        # =======================================================================
+        if not targets_detr:
+             return torch.tensor(0.0, device=self.device)
         
         _, sup_losses_dict = self.student(pixel_values=pixel_values, targets=targets_detr)
         return sum(sup_losses_dict.values())
-    # In your SSLSegmentationLightning class...
 
     def _get_unsup_loss_detr(self, strong_images: torch.Tensor, pseudo_targets: List[Dict]) -> torch.Tensor:
         self.student.train()
-        
-        # ============================ START: FINAL ROBUSTNESS FIX ============================
-        final_pseudo_targets = []
-        device = strong_images.device
-    
-        for target in pseudo_targets:
-            boxes = target.get("boxes")
-            
-            # Assume pseudo-labels are in xyxy format for this check
-            if boxes is not None and boxes.shape[0] > 0:
-                valid_indices = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
-                
-                # CASE 1: The image has at least one valid pseudo-label box.
-                if valid_indices.any():
-                    # Filter the target dictionary to keep only the valid entries.
-                    new_target = {key: value[valid_indices] for key, value in target.items()}
-                    final_pseudo_targets.append(new_target)
-                    continue # Move to the next target
-            
-            # CASE 2: The image has no boxes or no valid boxes.
-            # Append an "empty" target to maintain the 1-to-1 correspondence.
-            final_pseudo_targets.append({
-                "boxes": torch.empty((0, 4), dtype=torch.float32, device=device),
-                "labels": torch.empty(0, dtype=torch.long, device=device),
-                "masks": torch.empty(0, self.hparams.image_size, self.hparams.image_size, device=device) 
-                # Adjust mask shape if needed, this is a common default.
-            })
-            
-        # If for some reason the whole batch is empty (should not happen if batch_size > 0),
-        # return a zero loss to be safe.
-        if not final_pseudo_targets:
-            return torch.tensor(0.0, device=device, requires_grad=True)
-        
-        # Now, `strong_images` and `final_pseudo_targets` will always have the same length.
-        _, unsup_losses_dict = self.student(pixel_values=strong_images, targets=final_pseudo_targets)
-        # ============================= END: FINAL ROBUSTNESS FIX =============================
-        
+        # pseudo_targets from _create_pseudo_targets are already in cxcywh format
+        # and filtered. We just need to prepare them for the model.
+        targets_detr = self._prepare_detr_targets(pseudo_targets)
+        if not targets_detr:
+            return torch.tensor(0.0, device=strong_images.device)
+
+        _, unsup_losses_dict = self.student(pixel_values=strong_images, targets=targets_detr)
         return sum(unsup_losses_dict.values())
-    
 
     def _get_sup_loss_mrcnn(self, pixel_values: torch.Tensor, targets: List[Dict]) -> torch.Tensor:
         targets_mrcnn = self._prepare_mrcnn_targets(targets)
-        # The model returns a (predictions, losses) tuple.
-        # We only need the second element, which contains the loss dictionary.
-        _, losses_sup_dict = self.student(pixel_values, targets_mrcnn)
+        
+        # Filter out images that have no valid targets after preparation
+        valid_pixel_values = [img for img, t in zip(pixel_values, targets_mrcnn) if t['labels'].numel() > 0]
+        valid_targets = [t for t in targets_mrcnn if t['labels'].numel() > 0]
+
+        if not valid_targets:
+            return torch.tensor(0.0, device=self.device)
+
+        _, losses_sup_dict = self.student(valid_pixel_values, valid_targets)
         return sum(losses_sup_dict.values())
     
     def _create_pseudo_targets(self, preds: Union[Dict, List[Dict]], conf_thresh: float) -> List[Dict]:
@@ -241,18 +229,14 @@ class SSLSegmentationLightning(pl.LightningModule):
                 keep = scores > conf_thresh
     
                 if not keep.any():
-                    pseudo_targets.append({
-                        "labels": torch.empty((0,), dtype=torch.long, device=device),
-                        "boxes": torch.empty((0, 4), dtype=torch.float32, device=device),
-                        "masks": torch.empty((0, H, W), dtype=torch.float32, device=device)
-                    })
+                    pseudo_targets.append({}) # Append empty dict for placeholder
                     continue
     
                 masks_bin = (masks_logits[i][keep].sigmoid() > 0.5).float().detach() if masks_logits is not None else torch.empty((keep.sum(), H, W), device=device)
                 pseudo_targets.append({
-                    "labels": labels[keep].detach().to(device),
-                    "boxes": boxes_cxcywh[i][keep].detach().to(device),
-                    "masks": masks_bin.to(device)
+                    "labels": labels[keep].detach(),
+                    "boxes": boxes_cxcywh[i][keep].detach(),
+                    "masks": masks_bin
                 })
     
         # CASE 2: Mask R-CNN outputs (list of dicts)
@@ -260,27 +244,22 @@ class SSLSegmentationLightning(pl.LightningModule):
             for pred_dict in preds:
                 keep = pred_dict['scores'] > conf_thresh
                 if not keep.any():
-                    pseudo_targets.append({
-                        "labels": torch.empty((0,), dtype=torch.long, device=device),
-                        "boxes": torch.empty((0, 4), dtype=torch.float32, device=device),
-                        "masks": torch.empty((0, H, W), dtype=torch.float32, device=device)
-                    })
+                    pseudo_targets.append({})
                     continue
     
                 boxes_xyxy = pred_dict['boxes'][keep]
+                # Convert boxes to normalized cxcywh for consistency with DETR pipeline
                 boxes_cxcywh = box_convert(boxes_xyxy, in_fmt="xyxy", out_fmt="cxcywh")
-                # normalize
                 boxes_cxcywh[:, 0::2] /= W
                 boxes_cxcywh[:, 1::2] /= H
     
                 masks_bin = (pred_dict['masks'][keep] > 0.5).squeeze(1).float()
                 pseudo_targets.append({
-                    "labels": pred_dict['labels'][keep].detach().to(device),
-                    "boxes": boxes_cxcywh.detach().to(device),
-                    "masks": masks_bin.detach().to(device)
+                    "labels": pred_dict['labels'][keep].detach(),
+                    "boxes": boxes_cxcywh.detach(), # Already in cxcywh
+                    "masks": masks_bin.detach()
                 })
         return pseudo_targets
-
 
     def _prepare_detr_targets(self, targets: List[Dict]) -> List[Dict]:
         targets_detr = []
@@ -288,59 +267,109 @@ class SSLSegmentationLightning(pl.LightningModule):
         device = self.device
     
         for target in targets:
+            # Check for essential keys; if missing, it's an empty pseudo-target
+            if "masks" not in target or "labels" not in target:
+                continue
+            
             masks = target["masks"]
-    
-            # Skip if no masks exist at all
-            if masks.numel() == 0:
+            labels = target["labels"]
+            
+            # Skip if there are no annotations for this image
+            if masks.numel() == 0 or labels.numel() == 0:
                 continue
-    
-            # Keep only non-empty masks (at least 1 foreground pixel)
-            keep = masks.flatten(1).sum(1) > 0
-            if keep.sum() == 0:
-                # all masks are empty
+
+            # Filter out masks that are completely empty
+            keep = masks.any(dim=(-1, -2))
+            if not keep.any():
                 continue
-    
-            masks = masks[keep]
-            labels = target["labels"][keep]
-    
-            boxes_xyxy = masks_to_boxes(masks)
-            if boxes_xyxy.numel() == 0:
-                # safety check: skip if masks_to_boxes still produced nothing
+            
+            valid_masks = masks[keep]
+            valid_labels = labels[keep]
+
+            # Safely generate boxes from valid masks
+            boxes_xyxy = masks_to_boxes(valid_masks)
+            
+            # Filter out boxes with zero area (width or height is 0)
+            valid_box_indices = (boxes_xyxy[:, 2] > boxes_xyxy[:, 0]) & (boxes_xyxy[:, 3] > boxes_xyxy[:, 1])
+            if not valid_box_indices.any():
                 continue
-    
-            boxes_cxcywh = box_convert(boxes_xyxy, in_fmt="xyxy", out_fmt="cxcywh")
+
+            # Final filtering
+            final_masks = valid_masks[valid_box_indices]
+            final_labels = valid_labels[valid_box_indices]
+            final_boxes_xyxy = boxes_xyxy[valid_box_indices]
+
+            # Convert to normalized cxcywh format
+            boxes_cxcywh = box_convert(final_boxes_xyxy, in_fmt="xyxy", out_fmt="cxcywh")
             boxes_cxcywh[:, 0::2] /= w
             boxes_cxcywh[:, 1::2] /= h
-    
-            targets_detr.append({
-                "labels": labels.to(device),
-                "boxes": boxes_cxcywh.to(device),
-                "masks": masks.to(device).float()
-            })
-    
-        return targets_detr
 
+            targets_detr.append({
+                "labels": final_labels.to(device),
+                "boxes": boxes_cxcywh.to(device),
+                "masks": final_masks.to(device).float()
+            })
+        return targets_detr
+        
     def _prepare_mrcnn_targets(self, targets: List[Dict]) -> List[Dict]:
-        return [{
-            "boxes": masks_to_boxes(t["masks"].to(self.device)),
-            "labels": t["labels"].to(self.device),
-            "masks": t["masks"].to(self.device, torch.uint8)
-        } for t in targets]
+        prepared_targets = []
+        for t in targets:
+            masks = t.get("masks")
+            labels = t.get("labels")
+
+            # Skip if essential data is missing or empty
+            if masks is None or labels is None or masks.numel() == 0 or labels.numel() == 0:
+                prepared_targets.append({
+                    "boxes": torch.zeros((0, 4), dtype=torch.float32, device=self.device),
+                    "labels": torch.zeros((0,), dtype=torch.long, device=self.device),
+                    "masks": torch.zeros((0, self.hparams.image_size, self.hparams.image_size), dtype=torch.uint8, device=self.device)
+                })
+                continue
+            
+            # Filter out completely empty masks
+            keep = masks.any(dim=(-1, -2))
+            if not keep.any():
+                prepared_targets.append({
+                    "boxes": torch.zeros((0, 4), dtype=torch.float32, device=self.device),
+                    "labels": torch.zeros((0,), dtype=torch.long, device=self.device),
+                    "masks": torch.zeros((0, self.hparams.image_size, self.hparams.image_size), dtype=torch.uint8, device=self.device)
+                })
+                continue
+
+            valid_masks = masks[keep].to(self.device)
+            valid_labels = labels[keep].to(self.device)
+
+            # Safely generate boxes and filter for valid ones
+            boxes = masks_to_boxes(valid_masks)
+            valid_box_indices = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+            
+            prepared_targets.append({
+                "boxes": boxes[valid_box_indices],
+                "labels": valid_labels[valid_box_indices],
+                "masks": valid_masks[valid_box_indices].to(torch.uint8)
+            })
+        return prepared_targets
 
     def _format_targets_for_metric(self, targets: List[Dict]) -> List[Dict]:
-        return [{
-            'boxes': masks_to_boxes(t['masks']),
-            'labels': t['labels'],
-            'masks': t['masks'].to(torch.uint8)
-        } for t in targets]
+        # Reuse the robust mrcnn target prep for consistent formatting
+        return self._prepare_mrcnn_targets(targets)
 
     def _format_preds_mrcnn(self, outputs: List[Dict]) -> List[Dict]:
-        return [{
-            'scores': pred['scores'],
-            'labels': pred['labels'],
-            'boxes': pred['boxes'],
-            'masks': (pred['masks'] > 0.5).squeeze(1).to(torch.uint8)
-        } for pred in outputs]
+        formatted = []
+        for pred in outputs:
+            # Ensure all keys exist, providing empty tensors as defaults
+            scores = pred.get('scores', torch.tensor([], device=self.device))
+            labels = pred.get('labels', torch.tensor([], dtype=torch.long, device=self.device))
+            boxes = pred.get('boxes', torch.zeros((0, 4), device=self.device))
+            masks = pred.get('masks', torch.zeros((0, 1, self.hparams.image_size, self.hparams.image_size), device=self.device))
+
+            formatted.append({
+                'scores': scores,
+                'labels': labels,
+                'boxes': boxes,
+                'masks': (masks > 0.5).squeeze(1).to(torch.uint8) if masks.numel() > 0 else torch.empty((0, self.hparams.image_size, self.hparams.image_size), dtype=torch.uint8, device=self.device)
+            })
+        return formatted
 
     def _format_preds_detr_style(self, outputs: Dict, original_sizes: torch.Tensor) -> List[Dict]:
         preds = []
@@ -350,8 +379,10 @@ class SSLSegmentationLightning(pl.LightningModule):
             logits, boxes_norm, masks_logits = pred_logits[i], pred_boxes[i], pred_masks[i]
             probs = logits.softmax(-1)[..., :-1]
             scores, labels = probs.max(-1)
+            
             boxes = box_convert(boxes_norm, in_fmt="cxcywh", out_fmt="xyxy")
             boxes *= torch.tensor([w.item(), h.item(), w.item(), h.item()], device=boxes.device)
+            
             masks = F.interpolate(
                 masks_logits.unsqueeze(1),
                 size=(h.item(), w.item()),
@@ -359,5 +390,6 @@ class SSLSegmentationLightning(pl.LightningModule):
                 align_corners=False
             ).squeeze(1)
             masks = (masks.sigmoid() > 0.5).to(torch.uint8)
+            
             preds.append({"scores": scores, "labels": labels, "boxes": boxes, "masks": masks})
         return preds
