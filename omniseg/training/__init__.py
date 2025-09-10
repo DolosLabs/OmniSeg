@@ -122,10 +122,10 @@ class SSLSegmentationLightning(pl.LightningModule):
 
     def validation_step(self, batch: Tuple[torch.Tensor, List[Dict]], batch_idx: int):
         pixel_values, targets = batch
-
+    
         if self.hparams.head_type != 'maskrcnn' and not isinstance(pixel_values, torch.Tensor):
             pixel_values = torch.stack(pixel_values, dim=0)
-
+    
         # --- Calculate validation loss ---
         self.student.train() # Set to train mode for loss calculation
         with torch.no_grad():
@@ -147,30 +147,42 @@ class SSLSegmentationLightning(pl.LightningModule):
                 else:
                     val_loss = torch.tensor(0.0, device=self.device)
         self.log("val_loss", val_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-
+    
         # --- Calculate mAP ---
         self.student.eval() # Set to eval mode for predictions
         with torch.no_grad():
-            outputs, _ = self.student(pixel_values)
-
+            # The model output format can differ; assuming it returns a tuple
+            # where the first element contains the predictions.
+            # Adjust if your model's forward pass in eval mode is different.
+            outputs = self.student(pixel_values)
+            if isinstance(outputs, tuple):
+                 outputs = outputs[0]
+    
+    
         targets_formatted = self._format_targets_for_metric(targets)
-        original_sizes = torch.tensor([t.get('original_size', t['masks'].shape[-2:]) for t in targets], device=self.device)
-
+        # Ensure original_sizes are computed correctly even for empty targets
+        original_sizes = []
+        for t in targets:
+            if 'masks' in t and t['masks'].numel() > 0:
+                original_sizes.append(t.get('original_size', t['masks'].shape[-2:]))
+            elif 'original_size' in t:
+                 original_sizes.append(t['original_size'])
+            else:
+                # Fallback for empty targets: use the model's input image size
+                original_sizes.append((self.hparams.image_size, self.hparams.image_size))
+        original_sizes = torch.tensor(original_sizes, device=self.device)
+    
+    
         if self.hparams.head_type == 'maskrcnn':
             preds = self._format_preds_mrcnn(outputs)
         else:
             preds = self._format_preds_detr_style(outputs, original_sizes)
         
-        # Filter out empty predictions/targets before updating metric
-        valid_preds, valid_targets = [], []
-        for p, t in zip(preds, targets_formatted):
-            if p['scores'].numel() > 0 and t['labels'].numel() > 0:
-                valid_preds.append(p)
-                valid_targets.append(t)
+        # --- THIS IS THE CORRECTED PART ---
+        # Update the metric unconditionally.
+        # torchmetrics is designed to handle empty predictions/targets correctly.
+        self.val_map.update(preds, targets_formatted)
         
-        if valid_preds and valid_targets:
-            self.val_map.update(valid_preds, valid_targets)
-
     def on_validation_epoch_end(self):
         map_dict = self.val_map.compute()
         self.log_dict({
