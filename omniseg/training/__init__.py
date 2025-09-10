@@ -99,8 +99,11 @@ class SSLSegmentationLightning(pl.LightningModule):
             # 2. Create a strongly augmented view of the images on the fly
             pixel_values_u_strong = self.strong_augment(pixel_values_u)
 
-            # 3. Calculate student's loss on the strongly augmented view with the pseudo-labels
-            unsup_loss = self._get_unsup_loss_detr(pixel_values_u_strong, pseudo_targets)
+            # 3. Calculate student's loss using the correct function for the head type
+            if self.hparams.head_type == 'maskrcnn':
+                unsup_loss = self._get_unsup_loss_mrcnn(pixel_values_u_strong, pseudo_targets)
+            else:
+                unsup_loss = self._get_unsup_loss_detr(pixel_values_u_strong, pseudo_targets)
         else:
             # If no high-confidence pseudo-labels, unsupervised loss is zero for this batch
             unsup_loss = torch.tensor(0.0, device=self.device)
@@ -224,6 +227,21 @@ class SSLSegmentationLightning(pl.LightningModule):
         _, losses_sup_dict = self.student(valid_pixel_values, valid_targets)
         return sum(losses_sup_dict.values())
     
+    def _get_unsup_loss_mrcnn(self, strong_images: torch.Tensor, pseudo_targets: List[Dict]) -> torch.Tensor:
+        self.student.train()
+        # Prepare targets in the format Mask R-CNN expects
+        targets_mrcnn = self._prepare_mrcnn_targets(pseudo_targets)
+
+        # CRITICAL: Filter the images to match the targets that survived preparation.
+        # This ensures the number of images and targets are identical.
+        valid_pixel_values = [img for img, t in zip(strong_images, targets_mrcnn) if t['labels'].numel() > 0]
+        valid_targets = [t for t in targets_mrcnn if t['labels'].numel() > 0]
+
+        if not valid_targets:
+            return torch.tensor(0.0, device=strong_images.device)
+
+        _, losses_unsup_dict = self.student(valid_pixel_values, valid_targets)
+        return sum(losses_unsup_dict.values())
     def _create_pseudo_targets(self, preds: Union[Dict, List[Dict]], conf_thresh: float) -> List[Dict]:
         pseudo_targets = []
         H, W = self.hparams.image_size, self.hparams.image_size

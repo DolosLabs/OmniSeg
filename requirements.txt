@@ -12,3 +12,5 @@ timm
 scipy
 scikit-image
 matplotlib
+seaborn
+pandas

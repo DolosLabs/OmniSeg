@@ -9,18 +9,18 @@ login()
 # Passing backbone-head combinations
 experiments = [
     ("dino", "maskrcnn"),
-    ("dino", "lw_detr"),
-    ("dino", "deformable_detr"),
-    ("dino", "sparrow_seg"),
+    #("dino", "lw_detr"),
+    #("dino", "deformable_detr"),
+    #("dino", "sparrow_seg"),
     #("convnext", "deformable_detr"),
     ("convnext", "maskrcnn"),
     #("convnext", "lw_detr"),
-     # ("repvgg", "deformable_detr"),
-     ("repvgg", "maskrcnn"),
-     # ("repvgg", "lw_detr"),
-     # ("resnet", "deformable_detr"),
-     # ("resnet", "lw_detr"),
-    ("resnet", "maskrcnn"),
+    #("repvgg", "deformable_detr"),
+    ("repvgg", "maskrcnn"),
+    #("repvgg", "lw_detr"),
+    #("resnet", "deformable_detr"),
+    #("resnet", "lw_detr"),
+    #("resnet", "maskrcnn"),
 
 ]
 
@@ -32,19 +32,19 @@ for backbone, head in experiments:
     # batch size rule
     if backbone in ["repvgg", "resnet", "convnext"]:
         batch_size = 16
+        early_stop = 10
+        val_epoch = 1
+        epochs = 1
+    elif head in ["maskrcnn","deformable_detr"]:
+        batch_size = 24
         early_stop = 5
         val_epoch = 1
-        epochs = 50
-    elif head in ["maskrcnn"]:
-        batch_size = 16
-        early_stop = 5
-        val_epoch = 1
-        epochs = 50
+        epochs = 1
     else:
         batch_size = 128
         early_stop = 50
-        val_epoch = 10
-        epochs = 150
+        val_epoch = 1
+        epochs = 1
 
     print(f"\n🚀 Starting training: backbone={backbone}, head={head}, batch_size={batch_size}\n")
 
@@ -58,7 +58,9 @@ for backbone, head in experiments:
         "--learning_rate", str(1e-4),
         "--val_every_n_epoch", str(val_epoch),
         "--early_stopping_patience", str(early_stop),
-        "--epochs", str(epochs)
+        "--epochs", str(epochs),
+        "--num_labeled_images",str(10000),
+        "--unsup_rampup_steps",str(5000)
     ]
 
     # NEW: Add adjusted head configuration for DETR-style models on small images
