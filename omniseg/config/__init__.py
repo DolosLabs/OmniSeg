@@ -5,7 +5,7 @@ from typing import Dict, Any, List
 # --- Main Configuration ---
 PROJECT_DIR = './SSL_Instance_Segmentation'
 EPOCHS = 100
-NUM_CLASSES = 3
+NUM_CLASSES = 80
 
 # Backbone and Head Configuration
 BACKBONE_CONFIGS = {

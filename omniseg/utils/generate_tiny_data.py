@@ -5,11 +5,13 @@ Synthetic COCO dataset generator optimized for LW-DETR with DINOv3 backbone.
 - Object size: 16-32 pixels
 - Non-overlapping shapes
 - COCO RLE masks
+- Matches modified OmniSeg data pipeline with split test/unlabeled sets
 """
 
 import os
 import random
 import json
+import shutil
 import numpy as np
 from PIL import Image, ImageDraw
 from pycocotools import mask as mask_utils
@@ -18,8 +20,16 @@ from pycocotools import mask as mask_utils
 # Config
 # -------------------------
 BASE_DIR = "SSL_Instance_Segmentation/coco2017"
-IMAGES_DIR = {split: os.path.join(BASE_DIR, f"{split}2017") for split in ["train", "val", "test"]}
+IMAGES_DIR = {
+    "train": os.path.join(BASE_DIR, "train2017"),
+    "val": os.path.join(BASE_DIR, "val2017"),
+    "test": os.path.join(BASE_DIR, "test2017"),  # initially dump test here, then split
+}
 ANNOTATIONS_DIR = os.path.join(BASE_DIR, "annotations")
+
+SPLIT_TEST_DIR = os.path.join(BASE_DIR, "test2017_split")
+TEST_SUBDIR = os.path.join(SPLIT_TEST_DIR, "test")
+UNLABELED_SUBDIR = os.path.join(SPLIT_TEST_DIR, "unlabeled")
 
 CANVAS_SIZE = (128, 128)
 SHAPES_PER_IMAGE = (1, 5)  # min-max shapes
@@ -42,6 +52,8 @@ os.makedirs(BASE_DIR, exist_ok=True)
 os.makedirs(ANNOTATIONS_DIR, exist_ok=True)
 for d in IMAGES_DIR.values():
     os.makedirs(d, exist_ok=True)
+os.makedirs(TEST_SUBDIR, exist_ok=True)
+os.makedirs(UNLABELED_SUBDIR, exist_ok=True)
 
 # -------------------------
 # Helper functions
@@ -99,11 +111,9 @@ def generate_shapes_image():
         category_id = next(cat['id'] for cat in CATEGORIES if cat['name']==shape_type)
         color = tuple(random.randint(50,255) for _ in range(3))
 
-        # 1. Create a temporary canvas for the mask FIRST
         shape_canvas = Image.new('L', CANVAS_SIZE, 0)
         shape_draw = ImageDraw.Draw(shape_canvas)
 
-        # 2. Draw the shape ONLY on the temporary canvas
         if shape_type=='circle':
             radius = random.randint(16,32)
             draw_circle(shape_draw, center, radius, 255)
@@ -114,17 +124,13 @@ def generate_shapes_image():
             size = random.randint(16,32)
             draw_triangle(shape_draw, center, size, 255)
 
-        # 3. Create and check the mask from the temporary canvas
         mask_array = np.array(shape_canvas) > 0
         if np.sum(mask_array) < MIN_MASK_PIXELS:
-            continue # Skip this shape entirely if it's too small
+            continue
 
-        # 4. If the mask is valid, NOW draw the shape on the main canvas
-        # We can reuse the mask_array to draw efficiently
         mask_pil = Image.fromarray(mask_array)
         canvas.paste(color, mask=mask_pil)
             
-        # 5. Append the annotation info
         shapes_info.append({
             'category_id': category_id,
             'bbox': get_bbox(mask_array),
@@ -137,41 +143,58 @@ def generate_shapes_image():
 # -------------------------
 # Generate dataset
 # -------------------------
+def generate_split(split_name, num_images):
+    coco = {"info":{"description":"LW-DETR tiny synthetic dataset for DINOv3"},
+            "licenses":[],"images":[],"annotations":[],"categories":CATEGORIES}
+    ann_id = 1
+
+    for img_idx in range(num_images):
+        image_id = img_idx+1
+        filename = f"{image_id:012d}.jpg"
+        image_path = os.path.join(IMAGES_DIR[split_name], filename)
+
+        canvas, shapes_info = generate_shapes_image()
+        canvas.save(image_path,'JPEG')
+
+        coco["images"].append({"id":image_id,"width":CANVAS_SIZE[0],"height":CANVAS_SIZE[1],"file_name":filename})
+
+        for s in shapes_info:
+            coco["annotations"].append({
+                "id": ann_id,
+                "image_id": image_id,
+                "category_id": s['category_id'],
+                "segmentation": s['segmentation'],
+                "area": s['area'],
+                "bbox": s['bbox'],
+                "iscrowd": 0
+            })
+            ann_id += 1
+
+    with open(os.path.join(ANNOTATIONS_DIR,f"instances_{split_name}2017.json"),'w') as f:
+        json.dump(coco,f)
+
+def split_test_set():
+    """Split synthetic test set into test/unlabeled (move files)."""
+    all_imgs = sorted([f for f in os.listdir(IMAGES_DIR["test"]) if f.endswith(".jpg")])
+    random.shuffle(all_imgs)
+
+    split_idx = len(all_imgs)//2
+    test_imgs = all_imgs[:split_idx]
+    unlabeled_imgs = all_imgs[split_idx:]
+
+    for f in test_imgs:
+        shutil.move(os.path.join(IMAGES_DIR["test"], f), os.path.join(TEST_SUBDIR, f))
+    for f in unlabeled_imgs:
+        shutil.move(os.path.join(IMAGES_DIR["test"], f), os.path.join(UNLABELED_SUBDIR, f))
+
+    print(f"✅ Split {len(all_imgs)} synthetic test images into {len(test_imgs)} test and {len(unlabeled_imgs)} unlabeled")
+
 def main():
-    splits = {"train": N_TRAIN, "val": N_VAL, "test": N_TEST}
-
-    for split_name,num_images in splits.items():
-        coco = {"info":{"description":"LW-DETR tiny synthetic dataset for DINOv3"},
-                "licenses":[],"images":[],"annotations":[],"categories":CATEGORIES}
-        ann_id = 1
-
-        for img_idx in range(num_images):
-            image_id = img_idx+1
-            filename = f"{image_id:012d}.jpg"
-            image_path = os.path.join(IMAGES_DIR[split_name], filename)
-
-            canvas, shapes_info = generate_shapes_image()
-            canvas.save(image_path,'JPEG')
-
-            coco["images"].append({"id":image_id,"width":CANVAS_SIZE[0],"height":CANVAS_SIZE[1],"file_name":filename})
-
-            for s in shapes_info:
-                coco["annotations"].append({
-                    "id": ann_id,
-                    "image_id": image_id,
-                    "category_id": s['category_id'],
-                    "segmentation": s['segmentation'],
-                    "area": s['area'],
-                    "bbox": s['bbox'],
-                    "iscrowd": 0
-                })
-                ann_id += 1
-
-        with open(os.path.join(ANNOTATIONS_DIR,f"instances_{split_name}2017.json"),'w') as f:
-            json.dump(coco,f)
-
+    generate_split("train", N_TRAIN)
+    generate_split("val", N_VAL)
+    generate_split("test", N_TEST)
+    split_test_set()
     print("DINOv3-optimized LW-DETR tiny COCO dataset generated successfully!")
-
 
 if __name__ == "__main__":
     main()

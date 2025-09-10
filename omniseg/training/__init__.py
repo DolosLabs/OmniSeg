@@ -226,71 +226,98 @@ class SSLSegmentationLightning(pl.LightningModule):
     
     def _create_pseudo_targets(self, preds: Union[Dict, List[Dict]], conf_thresh: float) -> List[Dict]:
         pseudo_targets = []
+        H, W = self.hparams.image_size, self.hparams.image_size
+        device = self.device
     
-        # CASE 1: Handle DETR-style output (a single dictionary of batched tensors)
+        # CASE 1: DETR-style (batched dict)
         if isinstance(preds, dict):
-            logits, boxes_cxcywh, masks_logits = preds['pred_logits'], preds['pred_boxes'], preds['pred_masks']
-            for i in range(logits.shape[0]): # Iterate over batch
+            logits = preds['pred_logits']
+            boxes_cxcywh = preds['pred_boxes']
+            masks_logits = preds.get('pred_masks', None)
+    
+            for i in range(logits.shape[0]):
                 probs = logits[i].softmax(-1)[:, :-1]
                 scores, labels = probs.max(-1)
                 keep = scores > conf_thresh
     
                 if not keep.any():
                     pseudo_targets.append({
-                        "labels": torch.tensor([], dtype=torch.long, device=self.device),
-                        "boxes": torch.tensor([], device=self.device),
-                        "masks": torch.tensor([], device=self.device)
+                        "labels": torch.empty((0,), dtype=torch.long, device=device),
+                        "boxes": torch.empty((0, 4), dtype=torch.float32, device=device),
+                        "masks": torch.empty((0, H, W), dtype=torch.float32, device=device)
                     })
                     continue
     
+                masks_bin = (masks_logits[i][keep].sigmoid() > 0.5).float().detach() if masks_logits is not None else torch.empty((keep.sum(), H, W), device=device)
                 pseudo_targets.append({
-                    "labels": labels[keep].detach(),
-                    "boxes": boxes_cxcywh[i][keep].detach(),
-                    "masks": (masks_logits[i][keep].sigmoid() > 0.5).float().detach()
+                    "labels": labels[keep].detach().to(device),
+                    "boxes": boxes_cxcywh[i][keep].detach().to(device),
+                    "masks": masks_bin.to(device)
                 })
     
-        # CASE 2: Handle Mask R-CNN-style output (a list of dictionaries)
+        # CASE 2: Mask R-CNN outputs (list of dicts)
         elif isinstance(preds, list):
-            h, w = self.hparams.image_size, self.hparams.image_size
-            for pred_dict in preds: # Iterate over predictions for each image
+            for pred_dict in preds:
                 keep = pred_dict['scores'] > conf_thresh
-    
                 if not keep.any():
                     pseudo_targets.append({
-                        "labels": torch.tensor([], dtype=torch.long, device=self.device),
-                        "boxes": torch.tensor([], device=self.device),
-                        "masks": torch.tensor([], device=self.device)
+                        "labels": torch.empty((0,), dtype=torch.long, device=device),
+                        "boxes": torch.empty((0, 4), dtype=torch.float32, device=device),
+                        "masks": torch.empty((0, H, W), dtype=torch.float32, device=device)
                     })
                     continue
-                
-                # The unsupervised loss expects DETR format, so we must convert the boxes
+    
                 boxes_xyxy = pred_dict['boxes'][keep]
                 boxes_cxcywh = box_convert(boxes_xyxy, in_fmt="xyxy", out_fmt="cxcywh")
-                boxes_cxcywh[:, 0::2] /= w
-                boxes_cxcywh[:, 1::2] /= h
-                
+                # normalize
+                boxes_cxcywh[:, 0::2] /= W
+                boxes_cxcywh[:, 1::2] /= H
+    
+                masks_bin = (pred_dict['masks'][keep] > 0.5).squeeze(1).float()
                 pseudo_targets.append({
-                    "labels": pred_dict['labels'][keep].detach(),
-                    "boxes": boxes_cxcywh.detach(),
-                    "masks": (pred_dict['masks'][keep] > 0.5).squeeze(1).float().detach()
+                    "labels": pred_dict['labels'][keep].detach().to(device),
+                    "boxes": boxes_cxcywh.detach().to(device),
+                    "masks": masks_bin.detach().to(device)
                 })
-                
         return pseudo_targets
+
 
     def _prepare_detr_targets(self, targets: List[Dict]) -> List[Dict]:
         targets_detr = []
         h, w = self.hparams.image_size, self.hparams.image_size
         device = self.device
+    
         for target in targets:
-            boxes_xyxy = masks_to_boxes(target["masks"])
+            masks = target["masks"]
+    
+            # Skip if no masks exist at all
+            if masks.numel() == 0:
+                continue
+    
+            # Keep only non-empty masks (at least 1 foreground pixel)
+            keep = masks.flatten(1).sum(1) > 0
+            if keep.sum() == 0:
+                # all masks are empty
+                continue
+    
+            masks = masks[keep]
+            labels = target["labels"][keep]
+    
+            boxes_xyxy = masks_to_boxes(masks)
+            if boxes_xyxy.numel() == 0:
+                # safety check: skip if masks_to_boxes still produced nothing
+                continue
+    
             boxes_cxcywh = box_convert(boxes_xyxy, in_fmt="xyxy", out_fmt="cxcywh")
             boxes_cxcywh[:, 0::2] /= w
             boxes_cxcywh[:, 1::2] /= h
+    
             targets_detr.append({
-                "labels": target["labels"].to(device),
+                "labels": labels.to(device),
                 "boxes": boxes_cxcywh.to(device),
-                "masks": target["masks"].to(device).float()
+                "masks": masks.to(device).float()
             })
+    
         return targets_detr
 
     def _prepare_mrcnn_targets(self, targets: List[Dict]) -> List[Dict]:

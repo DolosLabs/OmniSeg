@@ -4,6 +4,7 @@ import os
 import random
 import zipfile
 import urllib.request
+import shutil
 from typing import List, Dict, Tuple, Any
 
 import numpy as np
@@ -16,6 +17,7 @@ from pycocotools.coco import COCO
 import tqdm
 import pytorch_lightning as pl
 from pytorch_lightning.utilities.combined_loader import CombinedLoader
+
 
 def download_coco2017(root_dir=".", splits=['train', 'val', 'test']):
     """Download COCO 2017 dataset."""
@@ -62,6 +64,49 @@ def download_coco2017(root_dir=".", splits=['train', 'val', 'test']):
     return base_dir
 
 
+def split_test_set(base_dir, split_ratio=0.5, seed=42):
+    """
+    Pre-split COCO test2017 into 'test' and 'unlabeled' subfolders.
+    Moves files instead of copying.
+    """
+    test_images_dir = os.path.join(base_dir, "test2017")
+    split_dir = os.path.join(base_dir, "test2017_split")
+    test_split_dir = os.path.join(split_dir, "test")
+    unlabeled_split_dir = os.path.join(split_dir, "unlabeled")
+
+    os.makedirs(test_split_dir, exist_ok=True)
+    os.makedirs(unlabeled_split_dir, exist_ok=True)
+
+    # Get all test2017 images still in original folder
+    all_imgs = [f for f in os.listdir(test_images_dir) if f.endswith(".jpg")]
+    all_imgs.sort()
+    random.seed(seed)
+    random.shuffle(all_imgs)
+
+    split_idx = int(len(all_imgs) * split_ratio)
+    test_imgs = all_imgs[:split_idx]
+    unlabeled_imgs = all_imgs[split_idx:]
+
+    # Move files
+    for f in test_imgs:
+        src = os.path.join(test_images_dir, f)
+        dst = os.path.join(test_split_dir, f)
+        if os.path.exists(src):  # only move if still in original
+            shutil.move(src, dst)
+
+    for f in unlabeled_imgs:
+        src = os.path.join(test_images_dir, f)
+        dst = os.path.join(unlabeled_split_dir, f)
+        if os.path.exists(src):
+            shutil.move(src, dst)
+
+    print(f"✅ Split {len(all_imgs)} test images into:")
+    print(f"  - {len(test_imgs)} in test folder")
+    print(f"  - {len(unlabeled_imgs)} in unlabeled folder")
+
+    return test_split_dir, unlabeled_split_dir
+
+
 def get_transforms(augment=False, image_size=224):
     """Get image transforms for training/validation."""
     transforms = []
@@ -70,39 +115,24 @@ def get_transforms(augment=False, image_size=224):
         transforms.append(T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1))
 
     transforms.append(T.Resize((image_size, image_size), antialias=True))
-    
-    # --- ✅ CORRECTED CODE ---
-    # 1. Convert PIL Image to a v2 tensor-like Image object
     transforms.append(T.ToImage()) 
-    # 2. Convert dtype to float and scale values from [0, 255] to [0.0, 1.0]
     transforms.append(T.ToDtype(torch.float32, scale=True))
-    # -------------------------
-
-    # Now, Normalize receives a tensor as expected.
     transforms.append(T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
     
     return T.Compose(transforms)
 
-# --- 2. Fixed and Integrated Dataset Class ---
-# This version is corrected to use the transformation pipeline properly.
 
 class SemiCOCODataset(Dataset):
     """
     Semi-supervised COCO dataset that correctly applies v2 transforms.
     """
-    
-    # MODIFIED: Added 'transform=None' to accept the pipeline
     def __init__(self, images_dir, ann_file=None, is_unlabeled=False, num_images=-1, transform=None):
         self.images_dir = images_dir
         self.is_unlabeled = is_unlabeled
         self.transform = transform
-        
-        # --- ✅ FIX: Initialize attributes here ---
-        # This ensures they always exist on the object instance.
         self.coco = None
         self.cat2label = {}
         self.label2cat = {}
-        # ----------------------------------------
         
         if self.is_unlabeled:
             self.img_files = [os.path.join(images_dir, f) for f in os.listdir(images_dir) if f.endswith('.jpg')]
@@ -111,12 +141,11 @@ class SemiCOCODataset(Dataset):
                 self.img_files = random.sample(self.img_files, num_images)
                 print(f"--- Using a random subset of {len(self.img_files)} unlabeled images. ---")
         else:
-            # Now, populate the attributes with real data
             self.coco = COCO(ann_file)
             all_img_ids = sorted(self.coco.getImgIds())
             cat_ids = self.coco.getCatIds()
             self.cat2label = {cat_id: i for i, cat_id in enumerate(cat_ids)}
-            self.label2cat = {v: k for k, v in self.cat2label.items()} # Now this correctly fills the empty dict
+            self.label2cat = {v: k for k, v in self.cat2label.items()}
             
             self.img_ids = [img_id for img_id in all_img_ids if len(self.coco.getAnnIds(imgIds=img_id, iscrowd=False)) > 0]
             if num_images > 0 and len(self.img_ids) > num_images:
@@ -127,16 +156,13 @@ class SemiCOCODataset(Dataset):
     def __len__(self):
         return len(self.img_files) if self.is_unlabeled else len(self.img_ids)
 
-    # In your SemiCOCODataset class
     def __getitem__(self, idx):
-        # --- Handle Unlabeled Data ---
         if self.is_unlabeled:
             image = Image.open(self.img_files[idx]).convert("RGB")
             if self.transform:
                 image, _ = self.transform(image, {})
             return image, {}
     
-        # --- Handle Labeled Data ---
         img_id = self.img_ids[idx]
         img_info = self.coco.loadImgs(img_id)[0]
         image = Image.open(os.path.join(self.images_dir, img_info['file_name'])).convert("RGB")
@@ -165,7 +191,6 @@ class SemiCOCODataset(Dataset):
         return image, target
 
 
-
 class COCODataModule(pl.LightningDataModule):
     """COCO data module for PyTorch Lightning."""
     def __init__(self, project_dir, batch_size=32, num_workers=2, image_size=224,
@@ -177,58 +202,50 @@ class COCODataModule(pl.LightningDataModule):
         self.image_size = image_size
         self.num_labeled_images = num_labeled_images
         self.num_unlabeled_images = num_unlabeled_images
-        
-        # Note: self.train_aug and self.val_aug are now defined in setup()
 
     def prepare_data(self):
-        """Downloads data if needed. Ran once per node."""
         download_coco2017(root_dir=self.project_dir, splits=['train', 'val', 'test'])
+
     @staticmethod
     def collate_fn(batch):
-        """
-        Custom collate function to handle batches of images and targets.
-        Images are stacked into a single tensor, while targets (dictionaries)
-        are gathered into a list.
-        """
-        # Separate images and targets from the batch
         images = [item[0] for item in batch]
         targets = [item[1] for item in batch]
-    
-        # Stack images into a single tensor (B, C, H, W)
         images = torch.stack(images, 0)
-    
-        # Return the batched images and the list of targets
         return images, targets
+
     def setup(self, stage=None):
-        """Sets up datasets. Ran on each GPU."""
-        # MODIFIED: Define transforms here as a best practice
         self.train_aug = get_transforms(augment=True, image_size=self.image_size)
         self.val_aug = get_transforms(augment=False, image_size=self.image_size)
         
         base_dir = os.path.join(self.project_dir, 'coco2017')
         train_images_dir = os.path.join(base_dir, 'train2017')
         val_images_dir = os.path.join(base_dir, 'val2017')
-        test_images_dir = os.path.join(base_dir, 'test2017') # Used for unlabeled data
+
+        # Split test set into test + unlabeled
+        test_split_dir, unlabeled_split_dir = split_test_set(base_dir)
+
         train_ann_file = os.path.join(base_dir, 'annotations', 'instances_train2017.json')
         val_ann_file = os.path.join(base_dir, 'annotations', 'instances_val2017.json')
 
-        # MODIFIED: Pass the correct transform to each dataset instance
         self.labeled_ds = SemiCOCODataset(
             train_images_dir, train_ann_file, 
             num_images=self.num_labeled_images, 
             transform=self.train_aug
         )
         self.unlabeled_ds = SemiCOCODataset(
-            test_images_dir, is_unlabeled=True, 
+            unlabeled_split_dir, is_unlabeled=True, 
             num_images=self.num_unlabeled_images, 
             transform=self.train_aug
+        )
+        self.test_ds = SemiCOCODataset(
+            test_split_dir, is_unlabeled=True,
+            transform=self.val_aug
         )
         self.val_ds = SemiCOCODataset(
             val_images_dir, val_ann_file, 
             transform=self.val_aug
         )
-        
-        # These assignments remain the same
+
         self.cat2label = self.labeled_ds.cat2label
         self.label2cat = self.labeled_ds.label2cat
         self.coco_gt_val = self.val_ds.coco
@@ -252,5 +269,10 @@ class COCODataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             collate_fn=self.collate_fn 
         )
-        
-
+    
+    def test_dataloader(self):
+        return DataLoader(
+            self.test_ds, batch_size=1, shuffle=False,
+            num_workers=self.num_workers,
+            collate_fn=self.collate_fn
+        )
