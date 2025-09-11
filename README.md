@@ -31,7 +31,7 @@ A versatile, semi-supervised instance segmentation framework built on PyTorch Li
 Clone the repository:
 
 ```bash
-git clone [https://github.com/DolosLabs/omniseg.git](https://github.com/DolosLabs/omniseg.git)
+git clone https://github.com/DolosLabs/omniseg.git
 cd omniseg
 ````
 
