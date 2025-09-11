@@ -14,3 +14,4 @@ scikit-image
 matplotlib
 seaborn
 pandas
+tabulate
