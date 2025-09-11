@@ -6,7 +6,7 @@ A versatile, semi-supervised instance segmentation framework built on PyTorch Li
 
 -   **Semi-Supervised Learning (SSL):** Leverages a teacher-student model architecture to use both labeled and unlabeled data, a crucial technique for training with limited annotations.
 -   **Flexible Backbones:** Supports a wide range of popular vision models as backbones, including:
-    -   **ViT:** DINO
+    -   **ViT:** DINOv3
     -   **CNN:** ResNet, ConvNeXt, RepVGG
     -   **Test:** Simple CNN backbone for testing and development
 -   **Modular Segmentation Heads:**
