@@ -90,6 +90,9 @@ python train.py --backbone dino --head maskrcnn --image_size 64
 ## 📊 Results and Visualizations
 
 Here are some sample predictions and performance metrics from different model combinations. The **test mAP** (mean Average Precision) is a key metric for instance segmentation quality.
+
+**Experiments were run with experiment.py on 128×128 synthetic images (boxes + masks). COCO2017 tests showed convergence, but full training on all 118k images would take several days.**
+
  ![Results cont.](docs/images/final_mAP_barchart.png)
 | Backbone | Head | Epochs | Test mAP | Inference (ms) | Example Output |
 | :--- | :--- | :--- | :--- | :--- | :--- |
