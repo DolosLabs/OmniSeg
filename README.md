@@ -2,6 +2,8 @@
 
 A versatile, semi-supervised instance segmentation framework built on PyTorch Lightning. OmniSeg enables training with various state-of-the-art backbones and segmentation heads on the COCO dataset. It's designed for flexibility, allowing researchers and developers to easily experiment with different model architectures and training strategies.
 
+I built OmniSeg in one week as a rapid prototyping experiment to test how far I could push a semi-supervised segmentation framework in a short timeframe. The result is a modular, PyTorch Lightning–based system supporting multiple backbones and heads, synthetic/tiny data modes for quick iteration, and scalable training for larger datasets. While experimental, it demonstrates my ability to execute quickly on research ideas and package them into usable code.
+
 ## ✨ Features
 
 -   **Semi-Supervised Learning (SSL):** Leverages a teacher-student model architecture to use both labeled and unlabeled data, a crucial technique for training with limited annotations.
