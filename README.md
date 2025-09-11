@@ -141,7 +141,6 @@ Contributions are welcome\! Feel free to open an issue or submit a pull request 
 
 ## 📝 Acknowledgments and Licensing
 
-  - OmniSeg is released under the **MIT License**.
   - Component Licenses:
       - **PyTorch:** BSD-style License
       - **PyTorch Lightning:** Apache 2.0
