@@ -207,7 +207,6 @@ marimo/_lsp/
 __marimo__/
 
 # Test files and datasets
-test_*.py
 SSL_Instance_Segmentation/
 coco2017/
 
@@ -222,6 +221,3 @@ safety-report.json
 pip-audit.json
 test_summary.md
 quick_test_results.json
-
-# Pre-commit hooks
-.pre-commit-config.yaml
