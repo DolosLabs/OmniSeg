@@ -1,0 +1,79 @@
+repos:
+  # Code formatting
+  - repo: https://github.com/psf/black
+    rev: 23.12.1
+    hooks:
+      - id: black
+        language_version: python3.9
+
+  # Import sorting
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: ["--profile", "black"]
+
+  # Linting
+  - repo: https://github.com/pycqa/flake8
+    rev: 7.0.0
+    hooks:
+      - id: flake8
+        additional_dependencies: [flake8-docstrings, flake8-typing-imports]
+        args: ['--max-line-length=88', '--extend-ignore=E203,W503,D100,D101,D102,D103,D104,D105,D106,D107']
+
+  # Security scanning
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.7.5
+    hooks:
+      - id: bandit
+        args: ['-c', 'pyproject.toml']
+        additional_dependencies: ["bandit[toml]"]
+
+  # Type checking
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.8.0
+    hooks:
+      - id: mypy
+        additional_dependencies: [types-requests, types-setuptools]
+        args: [--ignore-missing-imports]
+
+  # General hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        exclude: ^.*/.github/workflows/.*$
+      - id: check-added-large-files
+        args: ['--maxkb=10000']
+      - id: check-merge-conflict
+      - id: debug-statements
+      - id: check-docstring-first
+
+  # Secrets detection
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.4.0
+    hooks:
+      - id: detect-secrets
+        args: ['--baseline', '.secrets.baseline']
+        exclude: package.lock.json
+
+  # YAML formatting
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: v4.0.0-alpha.8
+    hooks:
+      - id: prettier
+        types: [yaml]
+        exclude: ^.*/.github/workflows/.*$
+
+  # Security - dependency check
+  - repo: local
+    hooks:
+      - id: safety
+        name: safety
+        entry: safety
+        args: [check, --json]
+        language: system
+        pass_filenames: false
+        files: requirements.*\.txt$

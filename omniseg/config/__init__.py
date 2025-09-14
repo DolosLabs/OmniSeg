@@ -35,11 +35,16 @@ def get_default_config(backbone_type: str, head_type: str) -> Dict[str, Any]:
         raise ValueError(f"Unknown head: {head_type}")
     
     return {
+        'backbone_type': backbone_type,
+        'head_type': head_type,
         'backbone': BACKBONE_CONFIGS[backbone_type],
         'head': HEAD_CONFIGS[head_type],
         'image_size': BACKBONE_CONFIGS[backbone_type]['default_size'],
         'batch_size': HEAD_CONFIGS[head_type]['batch_size'],
-        'precision': HEAD_CONFIGS[head_type]['precision']
+        'precision': HEAD_CONFIGS[head_type]['precision'],
+        'num_classes': NUM_CLASSES,
+        'learning_rate': 1e-4,
+        'max_epochs': EPOCHS
     }
 
 
@@ -51,3 +56,32 @@ def get_available_backbones() -> List[str]:
 def get_available_heads() -> List[str]:
     """Return list of available head types."""
     return list(HEAD_CONFIGS.keys())
+
+
+def validate_config(config: Dict[str, Any]) -> None:
+    """Validate configuration dictionary."""
+    required_fields = ['backbone_type', 'head_type', 'num_classes', 'image_size', 'learning_rate']
+    
+    for field in required_fields:
+        if field not in config:
+            raise ValueError(f"Missing required field: {field}")
+    
+    # Validate backbone and head types
+    if config['backbone_type'] not in BACKBONE_CONFIGS:
+        raise ValueError(f"Unknown backbone: {config['backbone_type']}")
+    if config['head_type'] not in HEAD_CONFIGS:
+        raise ValueError(f"Unknown head: {config['head_type']}")
+    
+    # Validate numeric values
+    if config['num_classes'] <= 0:
+        raise ValueError("num_classes must be positive")
+    if config['image_size'] <= 0:
+        raise ValueError("image_size must be positive")
+    if config['learning_rate'] <= 0:
+        raise ValueError("learning_rate must be positive")
+    
+    # Validate optional fields if present
+    if 'batch_size' in config and config['batch_size'] <= 0:
+        raise ValueError("batch_size must be positive")
+    if 'max_epochs' in config and config['max_epochs'] <= 0:
+        raise ValueError("max_epochs must be positive")

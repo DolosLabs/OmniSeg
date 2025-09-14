@@ -1,0 +1,430 @@
+name: Comprehensive Testing and Security
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+  schedule:
+    # Run weekly security scans
+    - cron: '0 2 * * 1'
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  # Code quality and linting
+  code-quality:
+    name: Code Quality & Linting
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-quality-${{ hashFiles('**/requirements-dev.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-quality-
+          ${{ runner.os }}-pip-
+          
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements-dev.txt
+        
+    - name: Run Black (Code Formatting)
+      run: black --check --diff .
+      
+    - name: Run isort (Import Sorting)
+      run: isort --check-only --diff .
+      
+    - name: Run flake8 (Linting)
+      run: flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+      
+    - name: Run mypy (Type Checking)
+      run: mypy omniseg --ignore-missing-imports
+      continue-on-error: true  # Type checking is advisory for now
+
+  # Security scanning
+  security:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-security-${{ hashFiles('**/requirements*.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-security-
+          ${{ runner.os }}-pip-
+          
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -r requirements-dev.txt
+        
+    - name: Run Bandit (Security Linting)
+      run: bandit -r omniseg/ -f json -o bandit-report.json || true
+      
+    - name: Upload Bandit Report
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: bandit-report
+        path: bandit-report.json
+        
+    - name: Run Safety (Dependency Vulnerability Check)
+      run: safety check --json --output safety-report.json || true
+      
+    - name: Upload Safety Report
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: safety-report
+        path: safety-report.json
+        
+    - name: Run Semgrep (SAST)
+      uses: returntocorp/semgrep-action@v1
+      with:
+        config: auto
+        generateSarif: "1"
+      continue-on-error: true
+      
+    - name: Upload Semgrep SARIF
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: semgrep.sarif
+      continue-on-error: true
+
+  # Unit tests
+  unit-tests:
+    name: Unit Tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+        exclude:
+          # Reduce matrix size for efficiency
+          - os: windows-latest
+            python-version: '3.9'
+          - os: macos-latest
+            python-version: '3.9'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+        
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-${{ matrix.python-version }}-pip-${{ hashFiles('**/requirements*.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-${{ matrix.python-version }}-pip-
+          ${{ runner.os }}-pip-
+          
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        pip install -r requirements.txt
+        pip install -r requirements-dev.txt
+        
+    - name: Run Unit Tests
+      run: |
+        pytest tests/ -v -m "unit" --cov=omniseg --cov-report=xml --cov-report=html --junitxml=pytest.xml
+        
+    - name: Upload Coverage to Codecov
+      uses: codecov/codecov-action@v3
+      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+      with:
+        file: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+        
+    - name: Upload Test Results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: test-results-${{ matrix.os }}-${{ matrix.python-version }}
+        path: |
+          pytest.xml
+          htmlcov/
+          coverage.xml
+
+  # Integration tests
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-integration-${{ hashFiles('**/requirements*.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-integration-
+          ${{ runner.os }}-pip-
+          
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        pip install -r requirements.txt
+        pip install -r requirements-dev.txt
+        
+    - name: Run Integration Tests
+      run: |
+        pytest tests/ -v -m "integration" --timeout=300
+        
+    - name: Upload Integration Test Results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: integration-test-results
+        path: pytest.xml
+
+  # Performance tests
+  performance-tests:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-performance-${{ hashFiles('**/requirements*.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-performance-
+          ${{ runner.os }}-pip-
+          
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        pip install -r requirements.txt
+        pip install -r requirements-dev.txt
+        
+    - name: Run Performance Tests
+      run: |
+        pytest tests/test_performance.py -v --benchmark-only --benchmark-json=benchmark.json
+        
+    - name: Upload Performance Results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: performance-results
+        path: benchmark.json
+
+  # Model compatibility tests (existing)
+  model-compatibility:
+    name: Model Compatibility Tests
+    runs-on: ubuntu-latest
+    needs: [code-quality]
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-models-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-models-
+          ${{ runner.os }}-pip-
+          
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        pip install -r requirements.txt
+        
+    - name: Run Model Compatibility Tests
+      env:
+        HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      run: |
+        ./tests/run_tests.sh
+        
+    - name: Upload Model Test Results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: model-test-results
+        path: tests/quick_test_results.json
+
+  # Security tests
+  security-tests:
+    name: Security Tests
+    runs-on: ubuntu-latest
+    needs: [security]
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-sectest-${{ hashFiles('**/requirements*.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-sectest-
+          ${{ runner.os }}-pip-
+          
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        pip install -r requirements.txt
+        pip install -r requirements-dev.txt
+        
+    - name: Run Security Tests
+      run: |
+        pytest tests/ -v -m "security"
+
+  # Documentation build
+  docs:
+    name: Documentation Build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements-dev.txt
+        
+    - name: Build Documentation
+      run: |
+        sphinx-build -b html docs/ docs/_build/html/
+      continue-on-error: true
+        
+    - name: Upload Documentation
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: documentation
+        path: docs/_build/html/
+
+  # Dependency updates check
+  dependency-check:
+    name: Dependency Updates
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Install pip-audit
+      run: pip install pip-audit
+      
+    - name: Check for vulnerable dependencies
+      run: |
+        pip-audit --desc --format=json --output=pip-audit.json || true
+        
+    - name: Upload Dependency Audit
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: dependency-audit
+        path: pip-audit.json
+
+  # Consolidate results
+  test-summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [code-quality, security, unit-tests, integration-tests, performance-tests, model-compatibility, security-tests]
+    if: always()
+    steps:
+    - name: Download All Artifacts
+      uses: actions/download-artifact@v3
+      
+    - name: Generate Test Summary
+      run: |
+        echo "# Test Summary" > test_summary.md
+        echo "" >> test_summary.md
+        echo "## Job Status" >> test_summary.md
+        echo "- Code Quality: ${{ needs.code-quality.result }}" >> test_summary.md
+        echo "- Security Scanning: ${{ needs.security.result }}" >> test_summary.md
+        echo "- Unit Tests: ${{ needs.unit-tests.result }}" >> test_summary.md
+        echo "- Integration Tests: ${{ needs.integration-tests.result }}" >> test_summary.md
+        echo "- Performance Tests: ${{ needs.performance-tests.result }}" >> test_summary.md
+        echo "- Model Compatibility: ${{ needs.model-compatibility.result }}" >> test_summary.md
+        echo "- Security Tests: ${{ needs.security-tests.result }}" >> test_summary.md
+        
+    - name: Upload Test Summary
+      uses: actions/upload-artifact@v3
+      with:
+        name: test-summary
+        path: test_summary.md
+        
+    - name: Comment PR with Summary
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const summary = fs.readFileSync('test_summary.md', 'utf8');
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: summary
+          });
