@@ -210,3 +210,18 @@ __marimo__/
 test_*.py
 SSL_Instance_Segmentation/
 coco2017/
+
+# Testing artifacts
+.pytest_cache/
+htmlcov/
+coverage.xml
+pytest.xml
+benchmark.json
+bandit-report.json
+safety-report.json
+pip-audit.json
+test_summary.md
+quick_test_results.json
+
+# Pre-commit hooks
+.pre-commit-config.yaml
